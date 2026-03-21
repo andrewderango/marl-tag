@@ -1,0 +1,17 @@
+CLAUDE.md
+
+# Training outputs (large files)
+snapshots/
+tensorboard_logs/
+results/
+figures/output/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# OS
+.DS_Store
