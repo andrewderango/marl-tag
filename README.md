@@ -5,9 +5,23 @@ Two agents — a **tagger** (red) and a **runner** (blue) — are trained via al
 
 ## Install
 
+**Using a virtual environment (recommended):**
+
 ```bash
-pip install pygame numpy gymnasium stable-baselines3 torch tensorboard
+python3 -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
 ```
+
+To deactivate the environment when you're done:
+```bash
+deactivate
+```
+
+> For GIF export in the renderer, also install `imageio` or `Pillow` (either works):
+> ```bash
+> pip install imageio
+> ```
 
 ## Workflow
 
