@@ -15,6 +15,10 @@ Usage:
     # Render three stages back-to-back and save as separate GIFs
     python render/visualize.py --stages --snapshots_dir snapshots --save_dir output/
 
+    # Replay all snapshots in order at a custom FPS (run any time after training)
+    python render/visualize.py --replay --fps 12
+    python render/visualize.py --replay --fps 4   # slower
+
 Recommended stages for the presentation:
   1. Early  (cycle 0000): random movement — chaotic, agents ignore each other
   2. Mid    (cycle 0100): basic pursuit/evasion beginning to emerge
@@ -77,8 +81,12 @@ def parse_args():
     # Three-stage mode
     p.add_argument("--stages", action="store_true",
                    help="Render three stages (early/mid/late) automatically.")
+    # Replay-all mode
+    p.add_argument("--replay", action="store_true",
+                   help="Play one episode per snapshot in cycle order — "
+                        "watch the agents evolve from cycle 0 to the last saved checkpoint.")
     p.add_argument("--snapshots_dir", type=str, default="snapshots",
-                   help="Directory with snapshots for --stages mode.")
+                   help="Directory with snapshots for --stages / --replay mode.")
     p.add_argument("--save_dir", type=str, default=None,
                    help="Directory to save GIFs for --stages mode.")
     # Common options
@@ -372,6 +380,53 @@ def main():
                     stage_name = stage_label.split()[0].lower()
                     gif_path   = os.path.join(args.save_dir, f"{stage_name}_stage.gif")
                     save_gif(all_frames, gif_path, args.fps)
+
+        elif args.replay:
+            # --- Replay-all mode ---
+            # Loads every snapshot in cycle order and plays one episode each.
+            # Use --fps to control playback speed without retraining.
+            import glob as _glob
+
+            def _parse_snaps(prefix):
+                files = sorted(_glob.glob(
+                    os.path.join(args.snapshots_dir, f"{prefix}_*.zip")
+                ))
+                out = {}
+                for f in files:
+                    base = os.path.basename(f)
+                    try:
+                        cycle = int(base.replace(f"{prefix}_", "").replace(".zip", ""))
+                        out[cycle] = f.replace(".zip", "")
+                    except ValueError:
+                        pass
+                return out
+
+            t_snaps = _parse_snaps("tagger")
+            r_snaps = _parse_snaps("runner")
+            common  = sorted(set(t_snaps) & set(r_snaps))
+
+            if not common:
+                print("[replay] No snapshot pairs found in "
+                      f"'{args.snapshots_dir}'. Run agents/train.py first.")
+            else:
+                dummy_t = TaggerEnv(seed=0)
+                dummy_r = RunnerEnv(seed=0)
+                print(f"[replay] {len(common)} snapshots — "
+                      f"cycles {common[0]}–{common[-1]}  |  "
+                      f"fps={args.fps}  |  ESC or close window to skip ahead")
+
+                for cycle in common:
+                    print(f"  Cycle {cycle:4d} / {common[-1]}", end="\r", flush=True)
+                    t_model = PPO.load(t_snaps[cycle], env=dummy_t)
+                    r_model = PPO.load(r_snaps[cycle], env=dummy_r)
+                    render_episode(
+                        t_model, r_model, renderer,
+                        seed          = args.seed + cycle,
+                        deterministic = args.deterministic,
+                        label         = f"Cycle {cycle} / {common[-1]}",
+                        record        = False,
+                    )
+                print("\n[replay] Done.")
 
         else:
             # --- Single-episode mode ---

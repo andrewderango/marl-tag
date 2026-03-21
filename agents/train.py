@@ -99,6 +99,20 @@ def parse_args():
         "--check_env", action="store_true",
         help="Run SB3's check_env() on both envs before training and exit.",
     )
+    p.add_argument(
+        "--render", action="store_true",
+        help="Open a pygame window and play one episode after each snapshot checkpoint. "
+             "Slows training slightly at checkpoint intervals only — no cost between them.",
+    )
+    p.add_argument(
+        "--replay", action="store_true",
+        help="After training completes, play back one episode per snapshot in cycle order "
+             "so you can watch the agents evolve from random to trained.",
+    )
+    p.add_argument(
+        "--render_fps", type=int, default=10,
+        help="Frames per second for the live render/replay window (default: 10).",
+    )
     return p.parse_args()
 
 
@@ -151,6 +165,14 @@ def main():
             f"n_steps ({args.n_steps}). "
             f"Try --steps_per_cycle {(args.steps_per_cycle // args.n_steps) * args.n_steps}."
         )
+
+    # --- Set up optional live renderer ---
+    # Imported here so pygame is never touched during a headless training run.
+    renderer = None
+    if args.render:
+        from render.visualize import TagRenderer
+        renderer = TagRenderer(fps=args.render_fps)
+        print("Live render enabled — pygame window will appear at each checkpoint.")
 
     # --- Create environments ---
     tagger_env = TaggerEnv(seed=args.seed)
@@ -232,6 +254,19 @@ def main():
                   f"Snapshots saved  |  "
                   f"cycle: {cycle_time:.1f}s  elapsed: {elapsed/60:.1f}min")
 
+            # --- Optional live render ---
+            if renderer is not None:
+                from render.visualize import render_episode
+                render_episode(
+                    tagger_model  = tagger_model,
+                    runner_model  = runner_model,
+                    renderer      = renderer,
+                    seed          = args.seed + cycle,
+                    deterministic = True,
+                    label         = f"Cycle {cycle}/{args.num_cycles}",
+                    record        = False,
+                )
+
     # --- Always save the very last cycle if it wasn't already a snapshot cycle ---
     if args.num_cycles % args.snapshot_freq != 0:
         final_runner = os.path.join(args.snapshots_dir, f"runner_{args.num_cycles:04d}")
@@ -239,6 +274,68 @@ def main():
         runner_model.save(final_runner)
         tagger_model.save(final_tagger)
         print(f"[Cycle {args.num_cycles}] Final snapshots saved.")
+
+    if renderer is not None:
+        renderer.quit()
+
+    # --- Post-training replay ---
+    # Loads every saved snapshot in cycle order and plays one episode each.
+    # Training is already done so this has zero effect on training speed.
+    if args.replay:
+        import glob as _glob
+        from render.visualize import TagRenderer, render_episode
+        from stable_baselines3 import PPO as _PPO
+        from env.tag_env import TaggerEnv as _TEnv, RunnerEnv as _REnv
+
+        # Discover all snapshot pairs that exist on disk
+        tagger_files = sorted(_glob.glob(os.path.join(args.snapshots_dir, "tagger_*.zip")))
+        runner_files = sorted(_glob.glob(os.path.join(args.snapshots_dir, "runner_*.zip")))
+
+        # Build a dict of cycle → path for each role, then keep only cycles
+        # that have BOTH a tagger and a runner snapshot.
+        def _parse(files, prefix):
+            out = {}
+            for f in files:
+                base = os.path.basename(f)
+                try:
+                    cycle = int(base.replace(f"{prefix}_", "").replace(".zip", ""))
+                    out[cycle] = f.replace(".zip", "")
+                except ValueError:
+                    pass
+            return out
+
+        t_snaps = _parse(tagger_files, "tagger")
+        r_snaps = _parse(runner_files, "runner")
+        common  = sorted(set(t_snaps) & set(r_snaps))
+
+        if not common:
+            print("[replay] No matching snapshot pairs found — skipping.")
+        else:
+            print(f"\n[replay] Playing back {len(common)} snapshots "
+                  f"(cycles {common[0]}–{common[-1]}).  "
+                  f"Close the window or press ESC to skip ahead.")
+
+            dummy_t = _TEnv(seed=0)
+            dummy_r = _REnv(seed=0)
+            replay_renderer = TagRenderer(fps=args.render_fps)
+
+            for cycle in common:
+                print(f"  [replay] Cycle {cycle:4d} / {common[-1]}", end="\r", flush=True)
+                t_model = _PPO.load(t_snaps[cycle], env=dummy_t)
+                r_model = _PPO.load(r_snaps[cycle], env=dummy_r)
+
+                render_episode(
+                    tagger_model  = t_model,
+                    runner_model  = r_model,
+                    renderer      = replay_renderer,
+                    seed          = args.seed + cycle,
+                    deterministic = True,
+                    label         = f"Cycle {cycle} / {common[-1]}",
+                    record        = False,
+                )
+
+            replay_renderer.quit()
+            print("\n[replay] Done.")
 
     total_time = time.time() - train_start
     print(f"\nTraining complete in {total_time/60:.1f} min.")
