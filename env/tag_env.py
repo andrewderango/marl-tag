@@ -14,11 +14,14 @@ action is computed inside step() so SB3 only sees a standard single-agent MDP.
    This avoids synchronisation bugs that arise when two separate envs would drift.
 
 2. Flat observation vector (MlpPolicy, not CNN)
-   We encode all task-relevant information explicitly:
-     [own_row_n, own_col_n, opp_row_n, opp_col_n, own_dr, own_dc, wall_patch...]
+   We encode all task-relevant information explicitly in 10 dimensions:
+     [own_row_n, own_col_n, opp_row_n, opp_col_n, own_dr, own_dc,
+      can_move_up, can_move_down, can_move_left, can_move_right]
    A CNN over raw 12×12 pixels would need many more samples to learn positional
    features from scratch, and the grid is small enough that explicit coordinates
    are unambiguous. Flat vector → MlpPolicy → faster training convergence.
+   Movement flags directly encode whether a cardinal action would be blocked by a wall,
+   so the agent learns navigation constraints without trial-and-error wall collisions.
 
 3. Partial observability via line-of-sight (LOS) occlusion
    If a wall cell lies on the ray between the two agents, the opponent's
@@ -55,29 +58,21 @@ from gymnasium import spaces
 # Constants
 # ---------------------------------------------------------------------------
 
-GRID_SIZE    = 12   # 12×12 grid; border cells are walls; interior is 10×10
-MAX_STEPS    = 200  # episode length cap; runner "wins" if this is reached
+GRID_SIZE = 12   # 12×12 grid; border cells are walls; interior is 10×10
+MAX_STEPS = 200  # episode length cap; runner "wins" if this is reached
 
-PATCH_RADIUS = 3                          # wall patch half-width (7×7 for obstacle lookahead)
-PATCH_SIZE   = 2 * PATCH_RADIUS + 1      # 7×7 = 49 cells
-N_ACTIONS    = 5
-OBS_DIM      = 6 + PATCH_SIZE * PATCH_SIZE   # 6 scalars + 49 wall values = 55
+N_ACTIONS = 5
+OBS_DIM   = 10   # 6 scalars (own pos, opp pos, velocity) + 4 binary movement flags
 
-# Interior obstacles: 20 cells arranged with 180° rotational symmetry.
-# Creates 4 corner hiding spots (L-blocks) and 2 horizontal chokepoint bars.
+# Interior obstacles: 11 cells.
+# Creates 2 corner hiding spots (L-blocks) and 1 horizontal chokepoint bar.
 INTERIOR_OBSTACLES = [
-    # NW L-block
-    (2, 2), (2, 3), (3, 2),
-    # NE L-block
-    (2, 8), (2, 9), (3, 9),
     # SW L-block
     (8, 2), (9, 2), (9, 3),
     # SE L-block
     (8, 9), (9, 8), (9, 9),
     # North chokepoint bar
     (4, 4), (4, 5), (4, 6), (4, 7),
-    # South chokepoint bar
-    (7, 4), (7, 5), (7, 6), (7, 7),
 ]
 
 # Action index → (delta_row, delta_col)
@@ -167,6 +162,21 @@ class GridState:
                 error += dr
         return True
 
+    def _get_movement_flags(self, pos: np.ndarray) -> np.ndarray:
+        """
+        Return a 4-element float32 array indicating passability in cardinal directions.
+        [can_move_up, can_move_down, can_move_left, can_move_right]
+        Each value is 1.0 (passable) or 0.0 (wall blocks movement).
+        """
+        flags = []
+        for action in range(4):  # UP, DOWN, LEFT, RIGHT
+            dr, dc = ACTIONS[action]
+            candidate = pos + np.array([dr, dc], dtype=np.int32)
+            candidate = np.clip(candidate, 0, self.grid_size - 1)
+            can_move = 0.0 if self.walls[candidate[0], candidate[1]] else 1.0
+            flags.append(can_move)
+        return np.array(flags, dtype=np.float32)
+
     def _try_move(self, pos: np.ndarray, action: int):
         """
         Attempt to move from pos using action. Returns (new_pos, actual_delta).
@@ -246,32 +256,11 @@ class GridState:
         }
         return tagger_reward, runner_reward, terminated, truncated, info
 
-    def get_local_patch(self, pos: np.ndarray) -> np.ndarray:
-        """
-        Return a flattened (PATCH_SIZE²,) float32 binary array of walls in the
-        (2*PATCH_RADIUS+1)² neighbourhood centred on pos.  Cells outside the
-        grid boundary are treated as walls (value 1).
-
-        Design note: a 7×7 patch (radius 3) lets the agent see 3 cells in every
-        direction.  This is essential with interior obstacles — agents need to
-        see chokepoints from 3 cells away to plan around them. The 49-value patch
-        provides sufficient local context for navigation.
-        """
-        pr = PATCH_RADIUS
-        patch = np.ones((PATCH_SIZE, PATCH_SIZE), dtype=np.float32)  # default: wall
-        r0, c0 = int(pos[0]), int(pos[1])
-        for dr in range(-pr, pr + 1):
-            for dc in range(-pr, pr + 1):
-                r, c = r0 + dr, c0 + dc
-                if 0 <= r < self.grid_size and 0 <= c < self.grid_size:
-                    patch[dr + pr, dc + pr] = float(self.walls[r, c])
-        return patch.flatten()
-
     def get_tagger_obs(self) -> np.ndarray:
         """
-        Tagger's observation vector (float32, shape (OBS_DIM,) = (55,)):
+        Tagger's observation vector (float32, shape (OBS_DIM,) = (10,)):
           [own_row_n, own_col_n, runner_row_n, runner_col_n, own_dr, own_dc,
-           wall_patch (49 values)]
+           can_move_up, can_move_down, can_move_left, can_move_right]
 
         Positions are normalised to [0, 1] by dividing by (grid_size − 1).
         Velocity components are in {−1, 0, 1} (raw deltas, already small).
@@ -279,6 +268,8 @@ class GridState:
         learn to distinguish visible from invisible opponents).
         Visibility is determined by line-of-sight: the runner is visible only
         if no wall cell lies on the ray between tagger and runner.
+        Movement flags are 1.0 (passable) or 0.0 (blocked by wall) for each
+        cardinal direction, allowing the agent to learn immediate navigation constraints.
         """
         norm = float(self.grid_size - 1)
         own_r = self.tagger_pos[0] / norm
@@ -292,16 +283,14 @@ class GridState:
 
         dr = float(self.tagger_last_d[0])
         dc = float(self.tagger_last_d[1])
-        patch = self.get_local_patch(self.tagger_pos)
-        return np.array([own_r, own_c, opp_r, opp_c, dr, dc], dtype=np.float32)  \
-               if False else \
-               np.concatenate([[own_r, own_c, opp_r, opp_c, dr, dc], patch]).astype(np.float32)
+        move_flags = self._get_movement_flags(self.tagger_pos)
+        return np.concatenate([[own_r, own_c, opp_r, opp_c, dr, dc], move_flags]).astype(np.float32)
 
     def get_runner_obs(self) -> np.ndarray:
         """
-        Runner's observation vector (float32, shape (OBS_DIM,) = (55,)):
+        Runner's observation vector (float32, shape (OBS_DIM,) = (10,)):
           [own_row_n, own_col_n, tagger_row_n, tagger_col_n, own_dr, own_dc,
-           wall_patch (49 values)]
+           can_move_up, can_move_down, can_move_left, can_move_right]
 
         Same partial observability logic: tagger position is masked to −1 when
         not visible by line-of-sight.  This forces the runner to learn to evade
@@ -309,6 +298,8 @@ class GridState:
         remembering last-known tagger position implicitly through the value fn.
         Visibility is determined by line-of-sight: the tagger is visible only
         if no wall cell lies on the ray between runner and tagger.
+        Movement flags are 1.0 (passable) or 0.0 (blocked by wall) for each
+        cardinal direction, allowing the agent to learn immediate navigation constraints.
         """
         norm = float(self.grid_size - 1)
         own_r = self.runner_pos[0] / norm
@@ -322,8 +313,8 @@ class GridState:
 
         dr = float(self.runner_last_d[0])
         dc = float(self.runner_last_d[1])
-        patch = self.get_local_patch(self.runner_pos)
-        return np.concatenate([[own_r, own_c, opp_r, opp_c, dr, dc], patch]).astype(np.float32)
+        move_flags = self._get_movement_flags(self.runner_pos)
+        return np.concatenate([[own_r, own_c, opp_r, opp_c, dr, dc], move_flags]).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -449,7 +440,7 @@ if __name__ == "__main__":
     obs, info = tagger_env.reset()
     print(f"obs shape : {obs.shape}  dtype: {obs.dtype}")
     print(f"obs[:6]   : {obs[:6]}  (own_r, own_c, opp_r, opp_c, dr, dc)")
-    print(f"obs[6:]   : {obs[6:]}  (49-cell wall patch)")
+    print(f"obs[6:]   : {obs[6:]}  (movement flags: up, down, left, right)")
     assert obs.shape == (OBS_DIM,), f"Expected ({OBS_DIM},), got {obs.shape}"
 
     total_r = 0.0
@@ -473,7 +464,7 @@ if __name__ == "__main__":
     obs, info = runner_env.reset()
     print(f"obs shape : {obs.shape}  dtype: {obs.dtype}")
     print(f"obs[:6]   : {obs[:6]}  (own_r, own_c, opp_r, opp_c, dr, dc)")
-    print(f"obs[6:]   : {obs[6:]}  (49-cell wall patch)")
+    print(f"obs[6:]   : {obs[6:]}  (movement flags: up, down, left, right)")
     assert obs.shape == (OBS_DIM,), f"Expected ({OBS_DIM},), got {obs.shape}"
 
     total_r = 0.0
@@ -489,6 +480,6 @@ if __name__ == "__main__":
           f"tagger_won={info['tagger_won']}  runner_won={info['runner_won']}")
     print(f"Total runner reward: {total_r:.2f}")
 
-    print("\n[PASS] obs shape = (55,), rewards are floats, "
+    print("\n[PASS] obs shape = (10,), rewards are floats, "
           "termination flags correct, episode terminates.")
     sys.exit(0)
