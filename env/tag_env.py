@@ -76,7 +76,7 @@ OBS_DIM   = 11   # 6 scalars (own pos, lk opp pos, velocity) + 4 movement flags 
 # Tagger reward shaping constants
 SHAPING_GAMMA   = 0.99   # must match PPO gamma
 SHAPING_SCALE   = 0.5    # weight on potential-based distance shaping
-STAY_PENALTY    = -0.05  # extra penalty for tagger choosing STAY (action 4)
+STAY_PENALTY    = -0.5   # extra penalty for tagger choosing STAY (action 4)
 REVISIT_PENALTY = -0.05  # penalty for tagger returning to a recently-visited cell
 REVISIT_WINDOW  = 8      # number of recent tagger positions tracked for loop detection
 
