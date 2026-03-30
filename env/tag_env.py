@@ -38,11 +38,16 @@ action is computed inside step() so SB3 only sees a standard single-agent MDP.
    Without it, the policy cannot distinguish "I'm moving towards the opponent"
    from "I just bounced off a wall and am now stationary".
 
-5. Reward design — sparse + small tagger time penalty
-   Runner: +1/step (survival), −10 on catch (distinguishes losing from winning).
-   Tagger: +10 on catch, −0.1/step (discourages stalling — without this, a tagger
-   that never catches the runner still gets reward 0, which is the same as the
-   initial untrained baseline and provides no gradient to improve from).
+5. Reward design — shaped tagger reward for dense learning signal
+   Runner: +1/step (survival), −10 on catch.
+   Tagger: +10 on catch, −0.1/step time penalty, plus three shaping components:
+     (a) Potential-based distance shaping: F = γ·Φ(s') − Φ(s), Φ(s) = −dist.
+         Provides a dense gradient toward the runner each step without altering
+         the optimal policy (Ng et al., 1999).
+     (b) STAY action penalty (−0.05): breaks standstill equilibria where the
+         tagger avoids negative expected reward by doing nothing.
+     (c) Revisit penalty (−0.05): penalises returning to a recently-visited cell,
+         breaking 2-step loop traps common in early self-play training.
 
 6. Simultaneous movement
    Both agents move at the same time each step. Sequential movement would give a
@@ -53,6 +58,7 @@ action is computed inside step() so SB3 only sees a standard single-agent MDP.
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
+from collections import deque
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -63,6 +69,13 @@ MAX_STEPS = 200  # episode length cap; runner "wins" if this is reached
 
 N_ACTIONS = 5
 OBS_DIM   = 10   # 6 scalars (own pos, opp pos, velocity) + 4 binary movement flags
+
+# Tagger reward shaping constants
+SHAPING_GAMMA   = 0.99   # must match PPO gamma
+SHAPING_SCALE   = 0.5    # weight on potential-based distance shaping
+STAY_PENALTY    = -0.05  # extra penalty for tagger choosing STAY (action 4)
+REVISIT_PENALTY = -0.05  # penalty for tagger returning to a recently-visited cell
+REVISIT_WINDOW  = 8      # number of recent tagger positions tracked for loop detection
 
 # Interior obstacles: 11 cells.
 # Creates 2 corner hiding spots (L-blocks) and 1 horizontal chokepoint bar.
@@ -124,6 +137,8 @@ class GridState:
         self.done       = False
         self.tagger_won = False
         self.runner_won = False
+
+        self._tagger_pos_history: deque = deque(maxlen=REVISIT_WINDOW)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -208,6 +223,7 @@ class GridState:
         self.done          = False
         self.tagger_won    = False
         self.runner_won    = False
+        self._tagger_pos_history.clear()
 
     def step(self, tagger_action: int, runner_action: int):
         """
@@ -216,8 +232,16 @@ class GridState:
 
         Simultaneous movement: both intended moves are resolved at the same time.
         This prevents first-mover advantages and matches the spirit of the game.
+
+        Tagger reward = −0.1 (time penalty)
+                      + γ·Φ(s') − Φ(s)  where Φ(s) = −dist  (potential-based shaping)
+                      + STAY_PENALTY if action == STAY  (break standstill equilibria)
+                      + REVISIT_PENALTY if new cell was recently visited  (break loops)
+                      + 10.0 on catch
         """
         assert not self.done, "step() called on a finished episode — call reset() first"
+
+        dist_before = float(np.sum(np.abs(self.tagger_pos - self.runner_pos)))
 
         new_tagger, t_delta = self._try_move(self.tagger_pos, tagger_action)
         new_runner, r_delta = self._try_move(self.runner_pos, runner_action)
@@ -231,9 +255,24 @@ class GridState:
         tagged    = bool(np.array_equal(self.tagger_pos, self.runner_pos))
         timed_out = self.step_count >= MAX_STEPS
 
-        # Per-step rewards
+        # Base per-step rewards
         tagger_reward = -0.1   # time penalty: tagger must actively pursue
         runner_reward =  1.0   # survival bonus: runner wants to last as long as possible
+
+        # Fix 1: Potential-based distance shaping — dense chase signal.
+        # F(s, s') = γ·Φ(s') − Φ(s), Φ(s) = −dist preserves the optimal policy.
+        dist_after = float(np.sum(np.abs(self.tagger_pos - self.runner_pos)))
+        tagger_reward += (SHAPING_GAMMA * (-dist_after) - (-dist_before)) * SHAPING_SCALE
+
+        # Fix 3: Extra STAY penalty — discourages standstill equilibria.
+        if tagger_action == 4:
+            tagger_reward += STAY_PENALTY
+
+        # Fix 2: Revisit penalty — discourages 2-step loops.
+        tagger_pos_key = (int(self.tagger_pos[0]), int(self.tagger_pos[1]))
+        if tagger_pos_key in self._tagger_pos_history:
+            tagger_reward += REVISIT_PENALTY
+        self._tagger_pos_history.append(tagger_pos_key)
 
         if tagged:
             tagger_reward += 10.0
