@@ -243,8 +243,6 @@ class GridState:
         Simultaneous movement: both intended moves are resolved at the same time.
         This prevents first-mover advantages and matches the spirit of the game.
 
-        Capture condition: tagger wins if Manhattan distance ≤ 1 (adjacent or same cell).
-
         Tagger reward = −0.1 (time penalty)
                       + γ·Φ(s') − Φ(s)  where Φ(s) = −dist  (potential-based shaping)
                       + STAY_PENALTY if action == STAY  (break standstill equilibria)
@@ -255,34 +253,53 @@ class GridState:
 
         dist_before = float(np.sum(np.abs(self.tagger_pos - self.runner_pos)))
 
+        # === TAGGER MOVES FIRST ===
         new_tagger, t_delta = self._try_move(self.tagger_pos, tagger_action)
-        new_runner, r_delta = self._try_move(self.runner_pos, runner_action)
-
-        self.tagger_pos    = new_tagger
-        self.runner_pos    = new_runner
+        self.tagger_pos = new_tagger
         self.tagger_last_d = t_delta
-        self.runner_last_d = r_delta
-        self.step_count   += 1
 
-        # Capture if tagger and runner are adjacent (distance ≤ 1)
-        manhattan_dist = int(np.sum(np.abs(self.tagger_pos - self.runner_pos)))
-        tagged    = bool(manhattan_dist <= 1)
+        # Check if tagger caught runner on its move
+        if np.array_equal(self.tagger_pos, self.runner_pos):
+            self.step_count += 1
+            self.done = True
+            self.tagger_won = True
+            tagger_reward = 10.0 - 0.1  # catch bonus + time penalty
+            runner_reward = 1.0 - 10.0  # survival bonus + catch penalty
+            if tagger_action == 4:
+                tagger_reward += STAY_PENALTY
+            info = {
+                "tagged": True,
+                "timed_out": False,
+                "step_count": self.step_count,
+                "tagger_won": True,
+                "runner_won": False,
+            }
+            return tagger_reward, runner_reward, True, False, info
+
+        # === RUNNER MOVES SECOND ===
+        new_runner, r_delta = self._try_move(self.runner_pos, runner_action)
+        self.runner_pos = new_runner
+        self.runner_last_d = r_delta
+        self.step_count += 1
+
+        # Check if tagger caught runner after runner moved
+        tagged = bool(np.array_equal(self.tagger_pos, self.runner_pos))
         timed_out = self.step_count >= MAX_STEPS
 
         # Base per-step rewards
         tagger_reward = -0.1   # time penalty: tagger must actively pursue
-        runner_reward =  1.0   # survival bonus: runner wants to last as long as possible
+        runner_reward = 1.0    # survival bonus: runner wants to last as long as possible
 
-        # Fix 1: Potential-based distance shaping — dense chase signal.
+        # Potential-based distance shaping — dense chase signal.
         # F(s, s') = γ·Φ(s') − Φ(s), Φ(s) = −dist preserves the optimal policy.
         dist_after = float(np.sum(np.abs(self.tagger_pos - self.runner_pos)))
         tagger_reward += (SHAPING_GAMMA * (-dist_after) - (-dist_before)) * SHAPING_SCALE
 
-        # Fix 3: Extra STAY penalty — discourages standstill equilibria.
+        # Extra STAY penalty — discourages standstill equilibria.
         if tagger_action == 4:
             tagger_reward += STAY_PENALTY
 
-        # Fix 2: Revisit penalty — discourages 2-step loops.
+        # Revisit penalty — discourages 2-step loops.
         tagger_pos_key = (int(self.tagger_pos[0]), int(self.tagger_pos[1]))
         if tagger_pos_key in self._tagger_pos_history:
             tagger_reward += REVISIT_PENALTY
@@ -295,17 +312,17 @@ class GridState:
             self.done = True
 
         terminated = tagged
-        truncated  = (not tagged) and timed_out
+        truncated = (not tagged) and timed_out
         if truncated:
             self.runner_won = True
             self.done = True
 
         info = {
-            "tagged":      tagged,
-            "timed_out":   timed_out,
-            "step_count":  self.step_count,
-            "tagger_won":  self.tagger_won,
-            "runner_won":  self.runner_won,
+            "tagged": tagged,
+            "timed_out": timed_out,
+            "step_count": self.step_count,
+            "tagger_won": self.tagger_won,
+            "runner_won": self.runner_won,
         }
         return tagger_reward, runner_reward, terminated, truncated, info
 
@@ -430,6 +447,20 @@ class TaggerEnv(gym.Env):
         tagger_reward, _, terminated, truncated, info = self.grid_state.step(
             int(tagger_action), runner_action
         )
+
+        # Every 10 steps, give tagger an extra move (runner stays still).
+        if self.grid_state.step_count % 10 == 0 and not (terminated or truncated):
+            tagger_obs = self.grid_state.get_tagger_obs()
+            if self.opponent_model is not None:
+                extra_tagger_action, _ = self.opponent_model.predict(tagger_obs, deterministic=False)
+                extra_tagger_action = int(extra_tagger_action)
+            else:
+                extra_tagger_action = self.action_space.sample()
+            extra_reward, _, terminated, truncated, info = self.grid_state.step(
+                extra_tagger_action, 4  # action 4 = STAY (runner doesn't move)
+            )
+            tagger_reward += extra_reward
+
         obs = self.grid_state.get_tagger_obs()
         return obs, float(tagger_reward), terminated, truncated, info
 
