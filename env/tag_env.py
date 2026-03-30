@@ -86,9 +86,9 @@ INTERIOR_OBSTACLES = [
     # SW L-block
     (8, 2), (9, 2), (9, 3),
     # SE L-block
-    (8, 9), (9, 8), (9, 9),
+    (7, 7), (7, 8), (7, 9), (8, 9), (9, 8), (9, 9),
     # North chokepoint bar
-    (4, 4), (4, 5), (4, 6), (4, 7),
+    (4, 4), (4, 5), (3, 5), (4, 6), (5, 6), (4, 7),
 ]
 
 # Action index → (delta_row, delta_col)
