@@ -14,23 +14,26 @@ action is computed inside step() so SB3 only sees a standard single-agent MDP.
    This avoids synchronisation bugs that arise when two separate envs would drift.
 
 2. Flat observation vector (MlpPolicy, not CNN)
-   We encode all task-relevant information explicitly in 10 dimensions:
-     [own_row_n, own_col_n, opp_row_n, opp_col_n, own_dr, own_dc,
-      can_move_up, can_move_down, can_move_left, can_move_right]
+   We encode all task-relevant information explicitly in 11 dimensions:
+     [own_row_n, own_col_n, lk_opp_row_n, lk_opp_col_n, own_dr, own_dc,
+      can_move_up, can_move_down, can_move_left, can_move_right, opp_visible]
    A CNN over raw 12×12 pixels would need many more samples to learn positional
    features from scratch, and the grid is small enough that explicit coordinates
    are unambiguous. Flat vector → MlpPolicy → faster training convergence.
    Movement flags directly encode whether a cardinal action would be blocked by a wall,
    so the agent learns navigation constraints without trial-and-error wall collisions.
 
-3. Partial observability via line-of-sight (LOS) occlusion
-   If a wall cell lies on the ray between the two agents, the opponent's
-   position is masked to −1 in the observation. −1 is outside the normal [0, 1]
-   normalised range, so the policy can learn to distinguish "I see them" from
-   "I don't" without a separate binary flag. This forces the runner to learn to
-   hide behind obstacles and the tagger to learn to search around them, making
-   evasion/pursuit non-trivial. LOS is computed with Bresenham's line algorithm
-   using integer arithmetic — conservative on diagonal corner touches.
+3. Partial observability via line-of-sight (LOS) occlusion with last-known position
+   If a wall cell lies on the ray between the two agents, the opponent's *current*
+   position is not known. The observation reports the last-known opponent position
+   (the most recent step where LOS was clear) plus an explicit binary `opp_visible`
+   flag (1.0 = currently visible, 0.0 = using stale last-known position). Before the
+   opponent is ever seen, the last-known position is −1 (a sentinel for "never seen").
+   This gives the policy a principled search target when the opponent hides, rather
+   than a useless −1 that conveys no spatial information. The explicit visibility flag
+   lets the policy learn to distinguish "I see them now" from "I last saw them there".
+   LOS is computed with Bresenham's line algorithm using integer arithmetic —
+   conservative on diagonal corner touches.
 
 4. Velocity (last displacement) in observation
    own_dr, own_dc ∈ {−1, 0, 1} encode the direction the agent moved last step.
@@ -68,7 +71,7 @@ GRID_SIZE = 12   # 12×12 grid; border cells are walls; interior is 10×10
 MAX_STEPS = 200  # episode length cap; runner "wins" if this is reached
 
 N_ACTIONS = 5
-OBS_DIM   = 10   # 6 scalars (own pos, opp pos, velocity) + 4 binary movement flags
+OBS_DIM   = 11   # 6 scalars (own pos, lk opp pos, velocity) + 4 movement flags + 1 visibility flag
 
 # Tagger reward shaping constants
 SHAPING_GAMMA   = 0.99   # must match PPO gamma
@@ -132,6 +135,11 @@ class GridState:
         self.runner_pos    = np.array([grid_size - 2, grid_size - 2], dtype=np.int32)
         self.tagger_last_d = np.zeros(2, dtype=np.int32)
         self.runner_last_d = np.zeros(2, dtype=np.int32)
+
+        # Last-known opponent positions (updated only when LOS is clear).
+        # −1 = never seen yet (episode start sentinel, outside [0,1] range).
+        self.tagger_last_known_runner = np.array([-1.0, -1.0], dtype=np.float32)
+        self.runner_last_known_tagger = np.array([-1.0, -1.0], dtype=np.float32)
 
         self.step_count = 0
         self.done       = False
@@ -219,6 +227,8 @@ class GridState:
         self.runner_pos    = np.array(passable[idx[1]], dtype=np.int32)
         self.tagger_last_d = np.zeros(2, dtype=np.int32)
         self.runner_last_d = np.zeros(2, dtype=np.int32)
+        self.tagger_last_known_runner = np.array([-1.0, -1.0], dtype=np.float32)
+        self.runner_last_known_tagger = np.array([-1.0, -1.0], dtype=np.float32)
         self.step_count    = 0
         self.done          = False
         self.tagger_won    = False
@@ -297,63 +307,67 @@ class GridState:
 
     def get_tagger_obs(self) -> np.ndarray:
         """
-        Tagger's observation vector (float32, shape (OBS_DIM,) = (10,)):
-          [own_row_n, own_col_n, runner_row_n, runner_col_n, own_dr, own_dc,
-           can_move_up, can_move_down, can_move_left, can_move_right]
+        Tagger's observation vector (float32, shape (OBS_DIM,) = (11,)):
+          [own_row_n, own_col_n, lk_runner_row_n, lk_runner_col_n, own_dr, own_dc,
+           can_move_up, can_move_down, can_move_left, can_move_right, opp_visible]
 
         Positions are normalised to [0, 1] by dividing by (grid_size − 1).
         Velocity components are in {−1, 0, 1} (raw deltas, already small).
-        Masked positions are −1 (outside the [0,1] range, so the policy can
-        learn to distinguish visible from invisible opponents).
-        Visibility is determined by line-of-sight: the runner is visible only
-        if no wall cell lies on the ray between tagger and runner.
-        Movement flags are 1.0 (passable) or 0.0 (blocked by wall) for each
-        cardinal direction, allowing the agent to learn immediate navigation constraints.
+        lk_runner_{row,col}_n is the *last-known* runner position: updated each step
+        when LOS is clear, held fixed when LOS is blocked. Before the runner has ever
+        been seen it is −1 (episode-start sentinel). opp_visible is 1.0 when the runner
+        is currently visible (LOS clear), 0.0 when using the stale last-known position.
+        Movement flags are 1.0 (passable) or 0.0 (blocked by wall) for each cardinal
+        direction, allowing the agent to learn immediate navigation constraints.
         """
         norm = float(self.grid_size - 1)
         own_r = self.tagger_pos[0] / norm
         own_c = self.tagger_pos[1] / norm
 
         if self._has_los(self.tagger_pos, self.runner_pos):
-            opp_r = self.runner_pos[0] / norm
-            opp_c = self.runner_pos[1] / norm
+            lk_r = self.runner_pos[0] / norm
+            lk_c = self.runner_pos[1] / norm
+            self.tagger_last_known_runner[:] = [lk_r, lk_c]
+            visible = 1.0
         else:
-            opp_r, opp_c = -1.0, -1.0   # partial observability: runner not visible
+            lk_r, lk_c = float(self.tagger_last_known_runner[0]), float(self.tagger_last_known_runner[1])
+            visible = 0.0
 
         dr = float(self.tagger_last_d[0])
         dc = float(self.tagger_last_d[1])
         move_flags = self._get_movement_flags(self.tagger_pos)
-        return np.concatenate([[own_r, own_c, opp_r, opp_c, dr, dc], move_flags]).astype(np.float32)
+        return np.concatenate([[own_r, own_c, lk_r, lk_c, dr, dc], move_flags, [visible]]).astype(np.float32)
 
     def get_runner_obs(self) -> np.ndarray:
         """
-        Runner's observation vector (float32, shape (OBS_DIM,) = (10,)):
-          [own_row_n, own_col_n, tagger_row_n, tagger_col_n, own_dr, own_dc,
-           can_move_up, can_move_down, can_move_left, can_move_right]
+        Runner's observation vector (float32, shape (OBS_DIM,) = (11,)):
+          [own_row_n, own_col_n, lk_tagger_row_n, lk_tagger_col_n, own_dr, own_dc,
+           can_move_up, can_move_down, can_move_left, can_move_right, opp_visible]
 
-        Same partial observability logic: tagger position is masked to −1 when
-        not visible by line-of-sight.  This forces the runner to learn to evade
-        even when the tagger is not visible — e.g. by moving to corners or by
-        remembering last-known tagger position implicitly through the value fn.
-        Visibility is determined by line-of-sight: the tagger is visible only
-        if no wall cell lies on the ray between runner and tagger.
-        Movement flags are 1.0 (passable) or 0.0 (blocked by wall) for each
-        cardinal direction, allowing the agent to learn immediate navigation constraints.
+        Same partial observability logic as the tagger: the last-known tagger position
+        is reported when LOS is blocked, together with an opp_visible flag (1.0 = tagger
+        currently in sight, 0.0 = using stale last-known position). Before the tagger
+        has ever been seen, the last-known position is −1 (episode-start sentinel).
+        Movement flags are 1.0 (passable) or 0.0 (blocked by wall) for each cardinal
+        direction, allowing the agent to learn immediate navigation constraints.
         """
         norm = float(self.grid_size - 1)
         own_r = self.runner_pos[0] / norm
         own_c = self.runner_pos[1] / norm
 
         if self._has_los(self.runner_pos, self.tagger_pos):
-            opp_r = self.tagger_pos[0] / norm
-            opp_c = self.tagger_pos[1] / norm
+            lk_r = self.tagger_pos[0] / norm
+            lk_c = self.tagger_pos[1] / norm
+            self.runner_last_known_tagger[:] = [lk_r, lk_c]
+            visible = 1.0
         else:
-            opp_r, opp_c = -1.0, -1.0   # partial observability: tagger not visible
+            lk_r, lk_c = float(self.runner_last_known_tagger[0]), float(self.runner_last_known_tagger[1])
+            visible = 0.0
 
         dr = float(self.runner_last_d[0])
         dc = float(self.runner_last_d[1])
         move_flags = self._get_movement_flags(self.runner_pos)
-        return np.concatenate([[own_r, own_c, opp_r, opp_c, dr, dc], move_flags]).astype(np.float32)
+        return np.concatenate([[own_r, own_c, lk_r, lk_c, dr, dc], move_flags, [visible]]).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -478,8 +492,9 @@ if __name__ == "__main__":
     tagger_env = TaggerEnv(seed=42)
     obs, info = tagger_env.reset()
     print(f"obs shape : {obs.shape}  dtype: {obs.dtype}")
-    print(f"obs[:6]   : {obs[:6]}  (own_r, own_c, opp_r, opp_c, dr, dc)")
-    print(f"obs[6:]   : {obs[6:]}  (movement flags: up, down, left, right)")
+    print(f"obs[:6]   : {obs[:6]}  (own_r, own_c, lk_opp_r, lk_opp_c, dr, dc)")
+    print(f"obs[6:10] : {obs[6:10]}  (movement flags: up, down, left, right)")
+    print(f"obs[10]   : {obs[10]}  (opp_visible)")
     assert obs.shape == (OBS_DIM,), f"Expected ({OBS_DIM},), got {obs.shape}"
 
     total_r = 0.0
@@ -502,8 +517,9 @@ if __name__ == "__main__":
     runner_env = RunnerEnv(seed=0)
     obs, info = runner_env.reset()
     print(f"obs shape : {obs.shape}  dtype: {obs.dtype}")
-    print(f"obs[:6]   : {obs[:6]}  (own_r, own_c, opp_r, opp_c, dr, dc)")
-    print(f"obs[6:]   : {obs[6:]}  (movement flags: up, down, left, right)")
+    print(f"obs[:6]   : {obs[:6]}  (own_r, own_c, lk_opp_r, lk_opp_c, dr, dc)")
+    print(f"obs[6:10] : {obs[6:10]}  (movement flags: up, down, left, right)")
+    print(f"obs[10]   : {obs[10]}  (opp_visible)")
     assert obs.shape == (OBS_DIM,), f"Expected ({OBS_DIM},), got {obs.shape}"
 
     total_r = 0.0
@@ -519,6 +535,6 @@ if __name__ == "__main__":
           f"tagger_won={info['tagger_won']}  runner_won={info['runner_won']}")
     print(f"Total runner reward: {total_r:.2f}")
 
-    print("\n[PASS] obs shape = (10,), rewards are floats, "
+    print("\n[PASS] obs shape = (11,), rewards are floats, "
           "termination flags correct, episode terminates.")
     sys.exit(0)
