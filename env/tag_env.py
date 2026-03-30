@@ -20,14 +20,14 @@ action is computed inside step() so SB3 only sees a standard single-agent MDP.
    features from scratch, and the grid is small enough that explicit coordinates
    are unambiguous. Flat vector → MlpPolicy → faster training convergence.
 
-3. Partial observability via visibility radius (Chebyshev distance)
-   If the opponent is more than VISIBILITY_RADIUS cells away (L∞ norm), their
+3. Partial observability via line-of-sight (LOS) occlusion
+   If a wall cell lies on the ray between the two agents, the opponent's
    position is masked to −1 in the observation. −1 is outside the normal [0, 1]
    normalised range, so the policy can learn to distinguish "I see them" from
    "I don't" without a separate binary flag. This forces the runner to learn to
-   hide and the tagger to learn to search, making evasion/pursuit non-trivial.
-   Chebyshev distance is chosen because it matches how the 5×5 wall patch is
-   computed and aligns with the 4-directional movement model.
+   hide behind obstacles and the tagger to learn to search around them, making
+   evasion/pursuit non-trivial. LOS is computed with Bresenham's line algorithm
+   using integer arithmetic — conservative on diagonal corner touches.
 
 4. Velocity (last displacement) in observation
    own_dr, own_dc ∈ {−1, 0, 1} encode the direction the agent moved last step.
@@ -55,14 +55,30 @@ from gymnasium import spaces
 # Constants
 # ---------------------------------------------------------------------------
 
-GRID_SIZE         = 12   # 12×12 grid; border cells are walls; interior is 10×10
-MAX_STEPS         = 200  # episode length cap; runner "wins" if this is reached
-VISIBILITY_RADIUS = 5    # Chebyshev radius beyond which opponent pos is masked
+GRID_SIZE    = 12   # 12×12 grid; border cells are walls; interior is 10×10
+MAX_STEPS    = 200  # episode length cap; runner "wins" if this is reached
 
-PATCH_RADIUS = 2                          # wall patch half-width
-PATCH_SIZE   = 2 * PATCH_RADIUS + 1      # 5×5 = 25 cells
+PATCH_RADIUS = 3                          # wall patch half-width (7×7 for obstacle lookahead)
+PATCH_SIZE   = 2 * PATCH_RADIUS + 1      # 7×7 = 49 cells
 N_ACTIONS    = 5
-OBS_DIM      = 6 + PATCH_SIZE * PATCH_SIZE   # 6 scalars + 25 wall values = 31
+OBS_DIM      = 6 + PATCH_SIZE * PATCH_SIZE   # 6 scalars + 49 wall values = 55
+
+# Interior obstacles: 20 cells arranged with 180° rotational symmetry.
+# Creates 4 corner hiding spots (L-blocks) and 2 horizontal chokepoint bars.
+INTERIOR_OBSTACLES = [
+    # NW L-block
+    (2, 2), (2, 3), (3, 2),
+    # NE L-block
+    (2, 8), (2, 9), (3, 9),
+    # SW L-block
+    (8, 2), (9, 2), (9, 3),
+    # SE L-block
+    (8, 9), (9, 8), (9, 9),
+    # North chokepoint bar
+    (4, 4), (4, 5), (4, 6), (4, 7),
+    # South chokepoint bar
+    (7, 4), (7, 5), (7, 6), (7, 7),
+]
 
 # Action index → (delta_row, delta_col)
 # Row increases downward; UP means row−1, DOWN means row+1.
@@ -94,14 +110,14 @@ class GridState:
         self.rng = np.random.default_rng(seed)
 
         # Static wall map: 1 = wall, 0 = passable.
-        # Simple baseline: only border walls, open interior.
-        # Adding internal walls is straightforward later but unnecessary for
-        # a working baseline (see CLAUDE.md notes on keeping env simple first).
+        # Border walls + interior obstacles for line-of-sight occlusion and hiding.
         self.walls = np.zeros((grid_size, grid_size), dtype=np.int8)
         self.walls[0, :]  = 1   # top border
         self.walls[-1, :] = 1   # bottom border
         self.walls[:, 0]  = 1   # left border
         self.walls[:, -1] = 1   # right border
+        for r, c in INTERIOR_OBSTACLES:
+            self.walls[r, c] = 1
 
         # Agent positions — initialised properly by reset()
         self.tagger_pos    = np.array([1, 1], dtype=np.int32)
@@ -123,9 +139,33 @@ class GridState:
         rows, cols = np.where(self.walls == 0)
         return list(zip(rows.tolist(), cols.tolist()))
 
-    def _chebyshev(self, a: np.ndarray, b: np.ndarray) -> int:
-        """L∞ distance between two positions — natural metric for grid movement."""
-        return int(np.max(np.abs(a.astype(int) - b.astype(int))))
+    def _has_los(self, a: np.ndarray, b: np.ndarray) -> bool:
+        """
+        Bresenham line-of-sight: returns True if no wall cell lies on the
+        integer rasterisation of the ray from a to b (exclusive of endpoint b,
+        inclusive of start a). Both positions are assumed to be passable.
+        """
+        r0, c0 = int(a[0]), int(a[1])
+        r1, c1 = int(b[0]), int(b[1])
+        dr = abs(r1 - r0)
+        dc = abs(c1 - c0)
+        r, c = r0, c0
+        n = 1 + dr + dc           # total cells visited (including start)
+        r_inc = 1 if r1 > r0 else -1
+        c_inc = 1 if c1 > c0 else -1
+        error = dr - dc
+        dr *= 2
+        dc *= 2
+        for _ in range(n - 1):    # iterate n-1 steps, stopping before endpoint
+            if self.walls[r, c]:  # wall at current cell blocks sight
+                return False
+            if error > 0:
+                r += r_inc
+                error -= dc
+            else:
+                c += c_inc
+                error += dr
+        return True
 
     def _try_move(self, pos: np.ndarray, action: int):
         """
@@ -212,11 +252,10 @@ class GridState:
         (2*PATCH_RADIUS+1)² neighbourhood centred on pos.  Cells outside the
         grid boundary are treated as walls (value 1).
 
-        Design note: a 5×5 patch (radius 2) lets the agent see 2 cells in every
-        direction.  This is enough to avoid walking into walls while keeping the
-        observation vector small (25 extra floats).  A larger patch would give
-        more look-ahead but diminishing returns — the border walls are the main
-        obstacle in the baseline environment.
+        Design note: a 7×7 patch (radius 3) lets the agent see 3 cells in every
+        direction.  This is essential with interior obstacles — agents need to
+        see chokepoints from 3 cells away to plan around them. The 49-value patch
+        provides sufficient local context for navigation.
         """
         pr = PATCH_RADIUS
         patch = np.ones((PATCH_SIZE, PATCH_SIZE), dtype=np.float32)  # default: wall
@@ -230,20 +269,22 @@ class GridState:
 
     def get_tagger_obs(self) -> np.ndarray:
         """
-        Tagger's observation vector (float32, shape (OBS_DIM,) = (31,)):
+        Tagger's observation vector (float32, shape (OBS_DIM,) = (55,)):
           [own_row_n, own_col_n, runner_row_n, runner_col_n, own_dr, own_dc,
-           wall_patch (25 values)]
+           wall_patch (49 values)]
 
         Positions are normalised to [0, 1] by dividing by (grid_size − 1).
         Velocity components are in {−1, 0, 1} (raw deltas, already small).
         Masked positions are −1 (outside the [0,1] range, so the policy can
         learn to distinguish visible from invisible opponents).
+        Visibility is determined by line-of-sight: the runner is visible only
+        if no wall cell lies on the ray between tagger and runner.
         """
         norm = float(self.grid_size - 1)
         own_r = self.tagger_pos[0] / norm
         own_c = self.tagger_pos[1] / norm
 
-        if self._chebyshev(self.tagger_pos, self.runner_pos) <= VISIBILITY_RADIUS:
+        if self._has_los(self.tagger_pos, self.runner_pos):
             opp_r = self.runner_pos[0] / norm
             opp_c = self.runner_pos[1] / norm
         else:
@@ -258,20 +299,22 @@ class GridState:
 
     def get_runner_obs(self) -> np.ndarray:
         """
-        Runner's observation vector (float32, shape (OBS_DIM,) = (31,)):
+        Runner's observation vector (float32, shape (OBS_DIM,) = (55,)):
           [own_row_n, own_col_n, tagger_row_n, tagger_col_n, own_dr, own_dc,
-           wall_patch (25 values)]
+           wall_patch (49 values)]
 
         Same partial observability logic: tagger position is masked to −1 when
-        outside VISIBILITY_RADIUS.  This forces the runner to learn to evade
+        not visible by line-of-sight.  This forces the runner to learn to evade
         even when the tagger is not visible — e.g. by moving to corners or by
         remembering last-known tagger position implicitly through the value fn.
+        Visibility is determined by line-of-sight: the tagger is visible only
+        if no wall cell lies on the ray between runner and tagger.
         """
         norm = float(self.grid_size - 1)
         own_r = self.runner_pos[0] / norm
         own_c = self.runner_pos[1] / norm
 
-        if self._chebyshev(self.runner_pos, self.tagger_pos) <= VISIBILITY_RADIUS:
+        if self._has_los(self.runner_pos, self.tagger_pos):
             opp_r = self.tagger_pos[0] / norm
             opp_c = self.tagger_pos[1] / norm
         else:
@@ -406,7 +449,7 @@ if __name__ == "__main__":
     obs, info = tagger_env.reset()
     print(f"obs shape : {obs.shape}  dtype: {obs.dtype}")
     print(f"obs[:6]   : {obs[:6]}  (own_r, own_c, opp_r, opp_c, dr, dc)")
-    print(f"obs[6:]   : {obs[6:]}  (25-cell wall patch)")
+    print(f"obs[6:]   : {obs[6:]}  (49-cell wall patch)")
     assert obs.shape == (OBS_DIM,), f"Expected ({OBS_DIM},), got {obs.shape}"
 
     total_r = 0.0
@@ -430,6 +473,7 @@ if __name__ == "__main__":
     obs, info = runner_env.reset()
     print(f"obs shape : {obs.shape}  dtype: {obs.dtype}")
     print(f"obs[:6]   : {obs[:6]}  (own_r, own_c, opp_r, opp_c, dr, dc)")
+    print(f"obs[6:]   : {obs[6:]}  (49-cell wall patch)")
     assert obs.shape == (OBS_DIM,), f"Expected ({OBS_DIM},), got {obs.shape}"
 
     total_r = 0.0
@@ -445,6 +489,6 @@ if __name__ == "__main__":
           f"tagger_won={info['tagger_won']}  runner_won={info['runner_won']}")
     print(f"Total runner reward: {total_r:.2f}")
 
-    print("\n[PASS] obs shape = (31,), rewards are floats, "
+    print("\n[PASS] obs shape = (55,), rewards are floats, "
           "termination flags correct, episode terminates.")
     sys.exit(0)
