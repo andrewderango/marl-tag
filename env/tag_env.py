@@ -243,6 +243,8 @@ class GridState:
         Simultaneous movement: both intended moves are resolved at the same time.
         This prevents first-mover advantages and matches the spirit of the game.
 
+        Capture condition: tagger wins if Manhattan distance ≤ 1 (adjacent or same cell).
+
         Tagger reward = −0.1 (time penalty)
                       + γ·Φ(s') − Φ(s)  where Φ(s) = −dist  (potential-based shaping)
                       + STAY_PENALTY if action == STAY  (break standstill equilibria)
@@ -262,7 +264,9 @@ class GridState:
         self.runner_last_d = r_delta
         self.step_count   += 1
 
-        tagged    = bool(np.array_equal(self.tagger_pos, self.runner_pos))
+        # Capture if tagger and runner are adjacent (distance ≤ 1)
+        manhattan_dist = int(np.sum(np.abs(self.tagger_pos - self.runner_pos)))
+        tagged    = bool(manhattan_dist <= 1)
         timed_out = self.step_count >= MAX_STEPS
 
         # Base per-step rewards
