@@ -14,20 +14,26 @@ action is computed inside step() so SB3 only sees a standard single-agent MDP.
    This avoids synchronisation bugs that arise when two separate envs would drift.
 
 2. Flat observation vector (MlpPolicy, not CNN)
-   We encode all task-relevant information explicitly:
-     [own_row_n, own_col_n, opp_row_n, opp_col_n, own_dr, own_dc, wall_patch...]
+   We encode all task-relevant information explicitly in 11 dimensions:
+     [own_row_n, own_col_n, lk_opp_row_n, lk_opp_col_n, own_dr, own_dc,
+      can_move_up, can_move_down, can_move_left, can_move_right, opp_visible]
    A CNN over raw 12×12 pixels would need many more samples to learn positional
    features from scratch, and the grid is small enough that explicit coordinates
    are unambiguous. Flat vector → MlpPolicy → faster training convergence.
+   Movement flags directly encode whether a cardinal action would be blocked by a wall,
+   so the agent learns navigation constraints without trial-and-error wall collisions.
 
-3. Partial observability via visibility radius (Chebyshev distance)
-   If the opponent is more than VISIBILITY_RADIUS cells away (L∞ norm), their
-   position is masked to −1 in the observation. −1 is outside the normal [0, 1]
-   normalised range, so the policy can learn to distinguish "I see them" from
-   "I don't" without a separate binary flag. This forces the runner to learn to
-   hide and the tagger to learn to search, making evasion/pursuit non-trivial.
-   Chebyshev distance is chosen because it matches how the 5×5 wall patch is
-   computed and aligns with the 4-directional movement model.
+3. Partial observability via line-of-sight (LOS) occlusion with last-known position
+   If a wall cell lies on the ray between the two agents, the opponent's *current*
+   position is not known. The observation reports the last-known opponent position
+   (the most recent step where LOS was clear) plus an explicit binary `opp_visible`
+   flag (1.0 = currently visible, 0.0 = using stale last-known position). Before the
+   opponent is ever seen, the last-known position is −1 (a sentinel for "never seen").
+   This gives the policy a principled search target when the opponent hides, rather
+   than a useless −1 that conveys no spatial information. The explicit visibility flag
+   lets the policy learn to distinguish "I see them now" from "I last saw them there".
+   LOS is computed with Bresenham's line algorithm using integer arithmetic —
+   conservative on diagonal corner touches.
 
 4. Velocity (last displacement) in observation
    own_dr, own_dc ∈ {−1, 0, 1} encode the direction the agent moved last step.
@@ -35,11 +41,21 @@ action is computed inside step() so SB3 only sees a standard single-agent MDP.
    Without it, the policy cannot distinguish "I'm moving towards the opponent"
    from "I just bounced off a wall and am now stationary".
 
-5. Reward design — sparse + small tagger time penalty
-   Runner: +1/step (survival), −10 on catch (distinguishes losing from winning).
-   Tagger: +10 on catch, −0.1/step (discourages stalling — without this, a tagger
-   that never catches the runner still gets reward 0, which is the same as the
-   initial untrained baseline and provides no gradient to improve from).
+5. Reward design — shaped rewards for both agents for dense learning signals
+   Tagger: +10 on catch, −0.1/step time penalty, plus three shaping components:
+     (a) Potential-based distance shaping: F = γ·Φ(s') − Φ(s), Φ(s) = −dist.
+         Provides a dense gradient toward the runner each step without altering
+         the optimal policy (Ng et al., 1999).
+     (b) STAY action penalty (−0.5): breaks standstill equilibria where the
+         tagger avoids negative expected reward by doing nothing.
+     (c) Revisit penalty (−0.2): penalises returning to a recently-visited cell,
+         breaking 2-step loop traps common in early self-play training.
+   Runner: +1/step (survival), −10 on catch, plus two shaping components:
+     (a) Potential-based escape shaping: F = γ·dist_after − dist_before.
+         Mirror of the tagger's shaping — dense gradient to maximise distance
+         from the tagger each step without altering the optimal policy.
+     (b) STAY action penalty (−0.1): discourages standing still when the tagger
+         approaches, which is the dominant failure mode without this signal.
 
 6. Simultaneous movement
    Both agents move at the same time each step. Sequential movement would give a
@@ -50,19 +66,38 @@ action is computed inside step() so SB3 only sees a standard single-agent MDP.
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
+from collections import deque
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-GRID_SIZE         = 12   # 12×12 grid; border cells are walls; interior is 10×10
-MAX_STEPS         = 200  # episode length cap; runner "wins" if this is reached
-VISIBILITY_RADIUS = 5    # Chebyshev radius beyond which opponent pos is masked
+GRID_SIZE = 12   # 12×12 grid; border cells are walls; interior is 10×10
+MAX_STEPS = 100  # episode length cap; runner "wins" if this is reached
 
-PATCH_RADIUS = 2                          # wall patch half-width
-PATCH_SIZE   = 2 * PATCH_RADIUS + 1      # 5×5 = 25 cells
-N_ACTIONS    = 5
-OBS_DIM      = 6 + PATCH_SIZE * PATCH_SIZE   # 6 scalars + 25 wall values = 31
+N_ACTIONS = 5
+OBS_DIM   = 11   # 6 scalars (own pos, lk opp pos, velocity) + 4 movement flags + 1 visibility flag
+
+# Tagger reward shaping constants
+SHAPING_GAMMA   = 0.99   # must match PPO gamma
+SHAPING_SCALE   = 0.5    # weight on potential-based distance shaping
+STAY_PENALTY    = -0.5   # extra penalty for tagger choosing STAY (action 4)
+REVISIT_PENALTY = -0.2   # penalty for tagger returning to a recently-visited cell
+REVISIT_WINDOW  = 8      # number of recent tagger positions tracked for loop detection
+
+# Runner reward shaping constants
+RUNNER_STAY_PENALTY = -0.1  # penalty for runner choosing STAY (discourage standing still)
+
+# Interior obstacles: 11 cells.
+# Creates 2 corner hiding spots (L-blocks) and 1 horizontal chokepoint bar.
+INTERIOR_OBSTACLES = [
+    # SW L-block
+    (8, 2), (9, 2), (9, 3),
+    # SE L-block
+    (7, 7), (7, 8), (7, 9), (8, 9), (9, 8), (9, 9),
+    # North chokepoint bar
+    (4, 4), (4, 5), (3, 5), (4, 6), (5, 6), (4, 7),
+]
 
 # Action index → (delta_row, delta_col)
 # Row increases downward; UP means row−1, DOWN means row+1.
@@ -94,14 +129,14 @@ class GridState:
         self.rng = np.random.default_rng(seed)
 
         # Static wall map: 1 = wall, 0 = passable.
-        # Simple baseline: only border walls, open interior.
-        # Adding internal walls is straightforward later but unnecessary for
-        # a working baseline (see CLAUDE.md notes on keeping env simple first).
+        # Border walls + interior obstacles for line-of-sight occlusion and hiding.
         self.walls = np.zeros((grid_size, grid_size), dtype=np.int8)
         self.walls[0, :]  = 1   # top border
         self.walls[-1, :] = 1   # bottom border
         self.walls[:, 0]  = 1   # left border
         self.walls[:, -1] = 1   # right border
+        for r, c in INTERIOR_OBSTACLES:
+            self.walls[r, c] = 1
 
         # Agent positions — initialised properly by reset()
         self.tagger_pos    = np.array([1, 1], dtype=np.int32)
@@ -109,10 +144,17 @@ class GridState:
         self.tagger_last_d = np.zeros(2, dtype=np.int32)
         self.runner_last_d = np.zeros(2, dtype=np.int32)
 
+        # Last-known opponent positions (updated only when LOS is clear).
+        # −1 = never seen yet (episode start sentinel, outside [0,1] range).
+        self.tagger_last_known_runner = np.array([-1.0, -1.0], dtype=np.float32)
+        self.runner_last_known_tagger = np.array([-1.0, -1.0], dtype=np.float32)
+
         self.step_count = 0
         self.done       = False
         self.tagger_won = False
         self.runner_won = False
+
+        self._tagger_pos_history: deque = deque(maxlen=REVISIT_WINDOW)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -123,9 +165,48 @@ class GridState:
         rows, cols = np.where(self.walls == 0)
         return list(zip(rows.tolist(), cols.tolist()))
 
-    def _chebyshev(self, a: np.ndarray, b: np.ndarray) -> int:
-        """L∞ distance between two positions — natural metric for grid movement."""
-        return int(np.max(np.abs(a.astype(int) - b.astype(int))))
+    def _has_los(self, a: np.ndarray, b: np.ndarray) -> bool:
+        """
+        Bresenham line-of-sight: returns True if no wall cell lies on the
+        integer rasterisation of the ray from a to b (exclusive of endpoint b,
+        inclusive of start a). Both positions are assumed to be passable.
+        """
+        r0, c0 = int(a[0]), int(a[1])
+        r1, c1 = int(b[0]), int(b[1])
+        dr = abs(r1 - r0)
+        dc = abs(c1 - c0)
+        r, c = r0, c0
+        n = 1 + dr + dc           # total cells visited (including start)
+        r_inc = 1 if r1 > r0 else -1
+        c_inc = 1 if c1 > c0 else -1
+        error = dr - dc
+        dr *= 2
+        dc *= 2
+        for _ in range(n - 1):    # iterate n-1 steps, stopping before endpoint
+            if self.walls[r, c]:  # wall at current cell blocks sight
+                return False
+            if error > 0:
+                r += r_inc
+                error -= dc
+            else:
+                c += c_inc
+                error += dr
+        return True
+
+    def _get_movement_flags(self, pos: np.ndarray) -> np.ndarray:
+        """
+        Return a 4-element float32 array indicating passability in cardinal directions.
+        [can_move_up, can_move_down, can_move_left, can_move_right]
+        Each value is 1.0 (passable) or 0.0 (wall blocks movement).
+        """
+        flags = []
+        for action in range(4):  # UP, DOWN, LEFT, RIGHT
+            dr, dc = ACTIONS[action]
+            candidate = pos + np.array([dr, dc], dtype=np.int32)
+            candidate = np.clip(candidate, 0, self.grid_size - 1)
+            can_move = 0.0 if self.walls[candidate[0], candidate[1]] else 1.0
+            flags.append(can_move)
+        return np.array(flags, dtype=np.float32)
 
     def _try_move(self, pos: np.ndarray, action: int):
         """
@@ -154,10 +235,13 @@ class GridState:
         self.runner_pos    = np.array(passable[idx[1]], dtype=np.int32)
         self.tagger_last_d = np.zeros(2, dtype=np.int32)
         self.runner_last_d = np.zeros(2, dtype=np.int32)
+        self.tagger_last_known_runner = np.array([-1.0, -1.0], dtype=np.float32)
+        self.runner_last_known_tagger = np.array([-1.0, -1.0], dtype=np.float32)
         self.step_count    = 0
         self.done          = False
         self.tagger_won    = False
         self.runner_won    = False
+        self._tagger_pos_history.clear()
 
     def step(self, tagger_action: int, runner_action: int):
         """
@@ -166,24 +250,76 @@ class GridState:
 
         Simultaneous movement: both intended moves are resolved at the same time.
         This prevents first-mover advantages and matches the spirit of the game.
+
+        Tagger reward = −0.1 (time penalty)
+                      + γ·Φ(s') − Φ(s)  where Φ(s) = −dist  (potential-based shaping)
+                      + STAY_PENALTY if action == STAY  (break standstill equilibria)
+                      + REVISIT_PENALTY if new cell was recently visited  (break loops)
+                      + 10.0 on catch
+        Runner reward = +1.0 (survival)
+                      + γ·dist_after − dist_before  (potential-based escape shaping)
+                      + RUNNER_STAY_PENALTY if action == STAY  (discourage standing still)
+                      − 10.0 on catch
         """
         assert not self.done, "step() called on a finished episode — call reset() first"
 
+        dist_before = float(np.sum(np.abs(self.tagger_pos - self.runner_pos)))
+
+        # === TAGGER MOVES FIRST ===
         new_tagger, t_delta = self._try_move(self.tagger_pos, tagger_action)
-        new_runner, r_delta = self._try_move(self.runner_pos, runner_action)
-
-        self.tagger_pos    = new_tagger
-        self.runner_pos    = new_runner
+        self.tagger_pos = new_tagger
         self.tagger_last_d = t_delta
-        self.runner_last_d = r_delta
-        self.step_count   += 1
 
-        tagged    = bool(np.array_equal(self.tagger_pos, self.runner_pos))
+        # Check if tagger caught runner on its move
+        if np.array_equal(self.tagger_pos, self.runner_pos):
+            self.step_count += 1
+            self.done = True
+            self.tagger_won = True
+            tagger_reward = 10.0 - 0.1  # catch bonus + time penalty
+            runner_reward = 1.0 - 10.0  # survival bonus + catch penalty
+            if tagger_action == 4:
+                tagger_reward += STAY_PENALTY
+            info = {
+                "tagged": True,
+                "timed_out": False,
+                "step_count": self.step_count,
+                "tagger_won": True,
+                "runner_won": False,
+            }
+            return tagger_reward, runner_reward, True, False, info
+
+        # === RUNNER MOVES SECOND ===
+        new_runner, r_delta = self._try_move(self.runner_pos, runner_action)
+        self.runner_pos = new_runner
+        self.runner_last_d = r_delta
+        self.step_count += 1
+
+        # Check if tagger caught runner after runner moved
+        tagged = bool(np.array_equal(self.tagger_pos, self.runner_pos))
         timed_out = self.step_count >= MAX_STEPS
 
-        # Per-step rewards
+        # Base per-step rewards
         tagger_reward = -0.1   # time penalty: tagger must actively pursue
-        runner_reward =  1.0   # survival bonus: runner wants to last as long as possible
+        runner_reward = 1.0    # survival bonus: runner wants to last as long as possible
+
+        # Potential-based distance shaping — dense chase/escape signals.
+        # F(s, s') = γ·Φ(s') − Φ(s), Φ(s) = −dist preserves the optimal policy.
+        dist_after = float(np.sum(np.abs(self.tagger_pos - self.runner_pos)))
+        tagger_reward += (SHAPING_GAMMA * (-dist_after) - (-dist_before)) * SHAPING_SCALE
+        # Runner shaping: reward increasing distance from tagger (Φ(s) = dist).
+        runner_reward += (SHAPING_GAMMA * dist_after - dist_before) * SHAPING_SCALE
+
+        # Extra STAY penalties — discourages standstill equilibria for both agents.
+        if tagger_action == 4:
+            tagger_reward += STAY_PENALTY
+        if runner_action == 4:
+            runner_reward += RUNNER_STAY_PENALTY
+
+        # Revisit penalty — discourages 2-step loops.
+        tagger_pos_key = (int(self.tagger_pos[0]), int(self.tagger_pos[1]))
+        if tagger_pos_key in self._tagger_pos_history:
+            tagger_reward += REVISIT_PENALTY
+        self._tagger_pos_history.append(tagger_pos_key)
 
         if tagged:
             tagger_reward += 10.0
@@ -192,95 +328,83 @@ class GridState:
             self.done = True
 
         terminated = tagged
-        truncated  = (not tagged) and timed_out
+        truncated = (not tagged) and timed_out
         if truncated:
             self.runner_won = True
             self.done = True
 
         info = {
-            "tagged":      tagged,
-            "timed_out":   timed_out,
-            "step_count":  self.step_count,
-            "tagger_won":  self.tagger_won,
-            "runner_won":  self.runner_won,
+            "tagged": tagged,
+            "timed_out": timed_out,
+            "step_count": self.step_count,
+            "tagger_won": self.tagger_won,
+            "runner_won": self.runner_won,
         }
         return tagger_reward, runner_reward, terminated, truncated, info
 
-    def get_local_patch(self, pos: np.ndarray) -> np.ndarray:
-        """
-        Return a flattened (PATCH_SIZE²,) float32 binary array of walls in the
-        (2*PATCH_RADIUS+1)² neighbourhood centred on pos.  Cells outside the
-        grid boundary are treated as walls (value 1).
-
-        Design note: a 5×5 patch (radius 2) lets the agent see 2 cells in every
-        direction.  This is enough to avoid walking into walls while keeping the
-        observation vector small (25 extra floats).  A larger patch would give
-        more look-ahead but diminishing returns — the border walls are the main
-        obstacle in the baseline environment.
-        """
-        pr = PATCH_RADIUS
-        patch = np.ones((PATCH_SIZE, PATCH_SIZE), dtype=np.float32)  # default: wall
-        r0, c0 = int(pos[0]), int(pos[1])
-        for dr in range(-pr, pr + 1):
-            for dc in range(-pr, pr + 1):
-                r, c = r0 + dr, c0 + dc
-                if 0 <= r < self.grid_size and 0 <= c < self.grid_size:
-                    patch[dr + pr, dc + pr] = float(self.walls[r, c])
-        return patch.flatten()
-
     def get_tagger_obs(self) -> np.ndarray:
         """
-        Tagger's observation vector (float32, shape (OBS_DIM,) = (31,)):
-          [own_row_n, own_col_n, runner_row_n, runner_col_n, own_dr, own_dc,
-           wall_patch (25 values)]
+        Tagger's observation vector (float32, shape (OBS_DIM,) = (11,)):
+          [own_row_n, own_col_n, lk_runner_row_n, lk_runner_col_n, own_dr, own_dc,
+           can_move_up, can_move_down, can_move_left, can_move_right, opp_visible]
 
         Positions are normalised to [0, 1] by dividing by (grid_size − 1).
         Velocity components are in {−1, 0, 1} (raw deltas, already small).
-        Masked positions are −1 (outside the [0,1] range, so the policy can
-        learn to distinguish visible from invisible opponents).
+        lk_runner_{row,col}_n is the *last-known* runner position: updated each step
+        when LOS is clear, held fixed when LOS is blocked. Before the runner has ever
+        been seen it is −1 (episode-start sentinel). opp_visible is 1.0 when the runner
+        is currently visible (LOS clear), 0.0 when using the stale last-known position.
+        Movement flags are 1.0 (passable) or 0.0 (blocked by wall) for each cardinal
+        direction, allowing the agent to learn immediate navigation constraints.
         """
         norm = float(self.grid_size - 1)
         own_r = self.tagger_pos[0] / norm
         own_c = self.tagger_pos[1] / norm
 
-        if self._chebyshev(self.tagger_pos, self.runner_pos) <= VISIBILITY_RADIUS:
-            opp_r = self.runner_pos[0] / norm
-            opp_c = self.runner_pos[1] / norm
+        if self._has_los(self.tagger_pos, self.runner_pos):
+            lk_r = self.runner_pos[0] / norm
+            lk_c = self.runner_pos[1] / norm
+            self.tagger_last_known_runner[:] = [lk_r, lk_c]
+            visible = 1.0
         else:
-            opp_r, opp_c = -1.0, -1.0   # partial observability: runner not visible
+            lk_r, lk_c = float(self.tagger_last_known_runner[0]), float(self.tagger_last_known_runner[1])
+            visible = 0.0
 
         dr = float(self.tagger_last_d[0])
         dc = float(self.tagger_last_d[1])
-        patch = self.get_local_patch(self.tagger_pos)
-        return np.array([own_r, own_c, opp_r, opp_c, dr, dc], dtype=np.float32)  \
-               if False else \
-               np.concatenate([[own_r, own_c, opp_r, opp_c, dr, dc], patch]).astype(np.float32)
+        move_flags = self._get_movement_flags(self.tagger_pos)
+        return np.concatenate([[own_r, own_c, lk_r, lk_c, dr, dc], move_flags, [visible]]).astype(np.float32)
 
     def get_runner_obs(self) -> np.ndarray:
         """
-        Runner's observation vector (float32, shape (OBS_DIM,) = (31,)):
-          [own_row_n, own_col_n, tagger_row_n, tagger_col_n, own_dr, own_dc,
-           wall_patch (25 values)]
+        Runner's observation vector (float32, shape (OBS_DIM,) = (11,)):
+          [own_row_n, own_col_n, lk_tagger_row_n, lk_tagger_col_n, own_dr, own_dc,
+           can_move_up, can_move_down, can_move_left, can_move_right, opp_visible]
 
-        Same partial observability logic: tagger position is masked to −1 when
-        outside VISIBILITY_RADIUS.  This forces the runner to learn to evade
-        even when the tagger is not visible — e.g. by moving to corners or by
-        remembering last-known tagger position implicitly through the value fn.
+        Same partial observability logic as the tagger: the last-known tagger position
+        is reported when LOS is blocked, together with an opp_visible flag (1.0 = tagger
+        currently in sight, 0.0 = using stale last-known position). Before the tagger
+        has ever been seen, the last-known position is −1 (episode-start sentinel).
+        Movement flags are 1.0 (passable) or 0.0 (blocked by wall) for each cardinal
+        direction, allowing the agent to learn immediate navigation constraints.
         """
         norm = float(self.grid_size - 1)
         own_r = self.runner_pos[0] / norm
         own_c = self.runner_pos[1] / norm
 
-        if self._chebyshev(self.runner_pos, self.tagger_pos) <= VISIBILITY_RADIUS:
-            opp_r = self.tagger_pos[0] / norm
-            opp_c = self.tagger_pos[1] / norm
+        if self._has_los(self.runner_pos, self.tagger_pos):
+            lk_r = self.tagger_pos[0] / norm
+            lk_c = self.tagger_pos[1] / norm
+            self.runner_last_known_tagger[:] = [lk_r, lk_c]
+            visible = 1.0
         else:
-            opp_r, opp_c = -1.0, -1.0   # partial observability: tagger not visible
+            lk_r, lk_c = float(self.runner_last_known_tagger[0]), float(self.runner_last_known_tagger[1])
+            visible = 0.0
 
         dr = float(self.runner_last_d[0])
         dc = float(self.runner_last_d[1])
-        patch = self.get_local_patch(self.runner_pos)
-        return np.concatenate([[own_r, own_c, opp_r, opp_c, dr, dc], patch]).astype(np.float32)
+        move_flags = self._get_movement_flags(self.runner_pos)
+        return np.concatenate([[own_r, own_c, lk_r, lk_c, dr, dc], move_flags, [visible]]).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +463,7 @@ class TaggerEnv(gym.Env):
         tagger_reward, _, terminated, truncated, info = self.grid_state.step(
             int(tagger_action), runner_action
         )
+
         obs = self.grid_state.get_tagger_obs()
         return obs, float(tagger_reward), terminated, truncated, info
 
@@ -387,6 +512,7 @@ class RunnerEnv(gym.Env):
         _, runner_reward, terminated, truncated, info = self.grid_state.step(
             tagger_action, int(runner_action)
         )
+
         obs = self.grid_state.get_runner_obs()
         return obs, float(runner_reward), terminated, truncated, info
 
@@ -405,8 +531,9 @@ if __name__ == "__main__":
     tagger_env = TaggerEnv(seed=42)
     obs, info = tagger_env.reset()
     print(f"obs shape : {obs.shape}  dtype: {obs.dtype}")
-    print(f"obs[:6]   : {obs[:6]}  (own_r, own_c, opp_r, opp_c, dr, dc)")
-    print(f"obs[6:]   : {obs[6:]}  (25-cell wall patch)")
+    print(f"obs[:6]   : {obs[:6]}  (own_r, own_c, lk_opp_r, lk_opp_c, dr, dc)")
+    print(f"obs[6:10] : {obs[6:10]}  (movement flags: up, down, left, right)")
+    print(f"obs[10]   : {obs[10]}  (opp_visible)")
     assert obs.shape == (OBS_DIM,), f"Expected ({OBS_DIM},), got {obs.shape}"
 
     total_r = 0.0
@@ -429,7 +556,9 @@ if __name__ == "__main__":
     runner_env = RunnerEnv(seed=0)
     obs, info = runner_env.reset()
     print(f"obs shape : {obs.shape}  dtype: {obs.dtype}")
-    print(f"obs[:6]   : {obs[:6]}  (own_r, own_c, opp_r, opp_c, dr, dc)")
+    print(f"obs[:6]   : {obs[:6]}  (own_r, own_c, lk_opp_r, lk_opp_c, dr, dc)")
+    print(f"obs[6:10] : {obs[6:10]}  (movement flags: up, down, left, right)")
+    print(f"obs[10]   : {obs[10]}  (opp_visible)")
     assert obs.shape == (OBS_DIM,), f"Expected ({OBS_DIM},), got {obs.shape}"
 
     total_r = 0.0
@@ -445,6 +574,6 @@ if __name__ == "__main__":
           f"tagger_won={info['tagger_won']}  runner_won={info['runner_won']}")
     print(f"Total runner reward: {total_r:.2f}")
 
-    print("\n[PASS] obs shape = (31,), rewards are floats, "
+    print("\n[PASS] obs shape = (11,), rewards are floats, "
           "termination flags correct, episode terminates.")
     sys.exit(0)

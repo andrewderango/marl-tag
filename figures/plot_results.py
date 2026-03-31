@@ -147,7 +147,7 @@ def plot_coevolution(results_dir: str, output_dir: str) -> None:
     ax.grid(axis="y", linestyle=":", linewidth=0.7, alpha=0.7)
     ax.grid(axis="y", which="minor", linestyle=":", linewidth=0.4, alpha=0.4)
 
-    # Reference line at MAX_STEPS = 200 (runner "perfect" evasion)
+    # Reference line at MAX_STEPS = 100 (runner "perfect" evasion)
     from env.tag_env import MAX_STEPS
     ax.axhline(MAX_STEPS, color="grey", linestyle=":", linewidth=1, label=f"Max steps ({MAX_STEPS})")
     ax.legend(loc="center right")
