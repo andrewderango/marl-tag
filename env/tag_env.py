@@ -97,20 +97,26 @@ RUNNER_STAY_PENALTY = -0.1  # penalty for runner choosing STAY (discourage stand
 # Interior obstacles: ~35 cells.
 # Creates 4 corner hideouts (L-blocks), 2 horizontal chokepoints, and 1 vertical bar.
 INTERIOR_OBSTACLES = [
-    # SW corner L-block (bottom-left)
-    (15, 3), (16, 3), (17, 3), (17, 4), (17, 5),
-    # SE corner L-block (bottom-right)
-    (14, 15), (15, 15), (16, 15), (17, 15), (17, 16), (17, 17),
-    # NW corner L-block (top-left)
-    (2, 3), (3, 3), (4, 3), (4, 4), (4, 5),
-    # NE corner L-block (top-right)
-    (2, 15), (3, 15), (4, 15), (4, 16), (4, 17),
-    # South horizontal chokepoint bar (row ~13)
-    (13, 7), (13, 8), (13, 9), (13, 10), (13, 11), (13, 12), (13, 13),
-    # North horizontal chokepoint bar (row ~6)
-    (6, 7), (6, 8), (6, 9), (6, 10), (6, 11), (6, 12), (6, 13),
-    # Central vertical bar (col ~10)
-    (9, 10), (10, 10), (11, 10),
+    # Upper right corner room
+    (1, 10), (2, 10), (3, 10), (4, 10), (5, 10), (5, 11), (5, 12), (5, 13), (5, 14), (5, 15), (5, 16), (5, 17),
+    (2, 12), (3, 12), (3, 13), (3, 14), (3, 15), (3, 16), (3, 17), (3, 18),
+    (1, 17), (2, 9),
+
+    # Upper left corner
+    (2, 2), (2, 3), (2, 4), (3, 2), (4, 2), (5, 2), (5, 3), (5, 4),
+
+    # Bottom bar
+    (17, 2), (17, 3), (17, 4), (17, 5), (17, 7), (17, 8), (17, 9), (17, 10), (17, 11), (17, 12), (17, 13), (17, 14), (17, 15), (17, 16), (17, 17),
+
+    # Middle islands
+    (13, 3), (12, 3), (12, 4), (11, 4), (12, 5), (12, 6), (11, 6), (13, 6), 
+    (8, 9), (9, 9), (10, 9), (8, 10), (9, 10), (10, 10), (8, 11), (9, 11), (10, 11), (8, 12), (9, 12), (10, 12), (8, 13), (9, 13), (10, 13),
+
+    # Middle blocks
+    (14, 8), (14, 9), (15, 8),
+    (13, 11),
+    (15, 13),
+    (13, 15), (14, 16),
 ]
 
 # Action index → (delta_row, delta_col)
