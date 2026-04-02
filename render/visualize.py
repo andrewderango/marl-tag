@@ -244,7 +244,7 @@ def render_episode(
             t_action, _ = tagger_model.predict(t_obs, deterministic=deterministic)
             t_action = int(t_action)
         else:
-            import random; t_action = random.randint(0, 4)
+            import random; t_action = random.randint(0, 8)
 
         if runner_model is not None:
             r_action, _ = runner_model.predict(r_obs, deterministic=deterministic)
