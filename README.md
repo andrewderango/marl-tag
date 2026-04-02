@@ -39,8 +39,17 @@ Key options:
 | `--steps_per_cycle` | 2048 | Env steps per agent per cycle |
 | `--snapshot_freq` | 8 | Save snapshots every N cycles |
 | `--seed` | 42 | Random seed |
+| `--resume_from` | 0 | Resume from this cycle (loads and continues from cycle+1) |
 
 Outputs: `snapshots/` (policy files) and `tensorboard_logs/` (training curves).
+
+**Resume training from a checkpoint:**
+
+If training is interrupted, resume from any saved cycle:
+```bash
+python agents/train.py --resume_from 40 --num_cycles 200
+```
+This loads `snapshots/tagger_0040.zip` and `snapshots/runner_0040.zip`, then continues from cycle 41 up to cycle 200. TensorBoard logs continue seamlessly from the saved timestep.
 
 Monitor training live:
 ```bash
