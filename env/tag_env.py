@@ -75,8 +75,8 @@ from collections import deque
 # Constants
 # ---------------------------------------------------------------------------
 
-GRID_SIZE = 12   # 12×12 grid; border cells are walls; interior is 10×10
-MAX_STEPS = 100  # episode length cap; runner "wins" if this is reached
+GRID_SIZE = 20   # 20×20 grid; border cells are walls; interior is 18×18
+MAX_STEPS = 150  # episode length cap; runner "wins" if this is reached
 
 N_ACTIONS = 5
 OBS_DIM   = 11   # 6 scalars (own pos, lk opp pos, velocity) + 4 movement flags + 1 visibility flag
@@ -94,15 +94,23 @@ REVISIT_WINDOW  = 8      # number of recent tagger positions tracked for loop de
 # Runner reward shaping constants
 RUNNER_STAY_PENALTY = -0.1  # penalty for runner choosing STAY (discourage standing still)
 
-# Interior obstacles: 11 cells.
-# Creates 2 corner hiding spots (L-blocks) and 1 horizontal chokepoint bar.
+# Interior obstacles: ~35 cells.
+# Creates 4 corner hideouts (L-blocks), 2 horizontal chokepoints, and 1 vertical bar.
 INTERIOR_OBSTACLES = [
-    # SW L-block
-    (8, 2), (9, 2), (9, 3),
-    # SE L-block
-    (7, 7), (7, 8), (7, 9), (8, 9), (9, 8), (9, 9),
-    # North chokepoint bar
-    (4, 4), (4, 5), (3, 5), (4, 6), (5, 6), (4, 7),
+    # SW corner L-block (bottom-left)
+    (15, 3), (16, 3), (17, 3), (17, 4), (17, 5),
+    # SE corner L-block (bottom-right)
+    (14, 15), (15, 15), (16, 15), (17, 15), (17, 16), (17, 17),
+    # NW corner L-block (top-left)
+    (2, 3), (3, 3), (4, 3), (4, 4), (4, 5),
+    # NE corner L-block (top-right)
+    (2, 15), (3, 15), (4, 15), (4, 16), (4, 17),
+    # South horizontal chokepoint bar (row ~13)
+    (13, 7), (13, 8), (13, 9), (13, 10), (13, 11), (13, 12), (13, 13),
+    # North horizontal chokepoint bar (row ~6)
+    (6, 7), (6, 8), (6, 9), (6, 10), (6, 11), (6, 12), (6, 13),
+    # Central vertical bar (col ~10)
+    (9, 10), (10, 10), (11, 10),
 ]
 
 # Action index → (delta_row, delta_col)
