@@ -1,7 +1,7 @@
 # tagRL
 Emergent Evasion Strategies via Multi-Agent Self-Play modelled by 2D Apex Predator–Prey interactions.
 
-Two agents — a **tagger** (red) and a **runner** (blue) — are trained via alternating PPO self-play on a 12×12 grid. The tagger tries to catch the runner as fast as possible; the runner tries to survive as long as possible. The core research contribution is a historical evaluation scheme that verifies genuine co-evolution rather than policy cycling.
+Two agents — a **tagger** (red) and a **runner** (blue) — are trained via alternating PPO self-play on a 20×20 grid. The tagger tries to catch the runner as fast as possible; the runner tries to survive as long as possible. The core research contribution is a historical evaluation scheme that verifies genuine co-evolution rather than policy cycling.
 
 ## Install
 
