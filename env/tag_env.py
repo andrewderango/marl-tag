@@ -76,7 +76,7 @@ from collections import deque
 # ---------------------------------------------------------------------------
 
 GRID_SIZE = 20   # 20×20 grid; border cells are walls; interior is 18×18
-MAX_STEPS = 150  # episode length cap; runner "wins" if this is reached
+MAX_STEPS = 100  # episode length cap; runner "wins" if this is reached
 
 N_ACTIONS = 5
 OBS_DIM   = 11   # 6 scalars (own pos, lk opp pos, velocity) + 4 movement flags + 1 visibility flag
@@ -280,11 +280,12 @@ class GridState:
                       + γ·Φ(s') − Φ(s)  where Φ(s) = −dist  (potential-based shaping)
                       + STAY_PENALTY if action == STAY  (break standstill equilibria)
                       + REVISIT_PENALTY if new cell was recently visited  (break loops)
-                      + 10.0 on catch
-        Runner reward = +1.0 (survival)
+                      + 20.0 on catch
+        Runner reward = +0.5 (survival)
                       + γ·dist_after − dist_before  (potential-based escape shaping)
                       + RUNNER_STAY_PENALTY if action == STAY  (discourage standing still)
-                      − 10.0 on catch
+                      − 20.0 on catch
+                      + 15.0 on episode timeout (survived to end)
         """
         assert not self.done, "step() called on a finished episode — call reset() first"
 
@@ -300,8 +301,8 @@ class GridState:
             self.step_count += 1
             self.done = True
             self.tagger_won = True
-            tagger_reward = 10.0 - 0.1  # catch bonus + time penalty
-            runner_reward = 1.0 - 10.0  # survival bonus + catch penalty
+            tagger_reward = 20.0 - 0.1  # catch bonus + time penalty
+            runner_reward = 0.5 - 20.0  # survival bonus + catch penalty
             if tagger_action == 4:
                 tagger_reward += STAY_PENALTY
             info = {
@@ -325,7 +326,7 @@ class GridState:
 
         # Base per-step rewards
         tagger_reward = -0.1   # time penalty: tagger must actively pursue
-        runner_reward = 1.0    # survival bonus: runner wants to last as long as possible
+        runner_reward = 0.5    # survival bonus: runner wants to last as long as possible
 
         # Potential-based distance shaping — dense chase/escape signals.
         # F(s, s') = γ·Φ(s') − Φ(s), Φ(s) = −dist preserves the optimal policy.
@@ -347,14 +348,15 @@ class GridState:
         self._tagger_pos_history.append(tagger_pos_key)
 
         if tagged:
-            tagger_reward += 10.0
-            runner_reward += -10.0
+            tagger_reward += 20.0
+            runner_reward += -20.0
             self.tagger_won = True
             self.done = True
 
         terminated = tagged
         truncated = (not tagged) and timed_out
         if truncated:
+            runner_reward += 15.0  # terminal survival bonus: reward making it to the end
             self.runner_won = True
             self.done = True
 
