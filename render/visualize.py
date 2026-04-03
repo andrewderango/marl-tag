@@ -117,49 +117,60 @@ class TagRenderer:
     def __init__(self, fps: int = 8):
         pygame.init()
         pygame.display.set_caption("Tag RL — Demo")
-        self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
+        self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H), pygame.RESIZABLE)
         self.clock  = pygame.font.SysFont(None, 22)
         self.font   = pygame.font.SysFont("monospace", 16)
         self.fps_clock = pygame.time.Clock()
         self.fps    = fps
 
+    def _layout(self):
+        """Compute dynamic layout from current window size."""
+        w, h = self.screen.get_size()
+        margin     = max(4, min(MARGIN, w // 80))
+        info_h     = INFO_HEIGHT
+        cell_size  = max(8, min((w - 2 * margin) // GRID_SIZE,
+                                (h - 2 * margin - info_h) // GRID_SIZE))
+        grid_px    = cell_size * GRID_SIZE
+        gx0        = (w - grid_px) // 2
+        gy0        = (h - grid_px - info_h) // 2
+        return w, h, cell_size, gx0, gy0, info_h
+
     def draw(self, gs: GridState, step: int, label: str = "") -> None:
         """Draw current game state."""
         self.screen.fill(BG_COLOR)
 
-        gx0 = MARGIN
-        gy0 = MARGIN
+        w, h, cell_size, gx0, gy0, info_h = self._layout()
 
         # Draw grid cells
         for r in range(GRID_SIZE):
             for c in range(GRID_SIZE):
-                x = gx0 + c * CELL_SIZE
-                y = gy0 + r * CELL_SIZE
+                x = gx0 + c * cell_size
+                y = gy0 + r * cell_size
                 color = WALL_COLOR if gs.walls[r, c] else CELL_COLOR
-                pygame.draw.rect(self.screen, color, (x, y, CELL_SIZE, CELL_SIZE))
-                pygame.draw.rect(self.screen, GRID_COLOR, (x, y, CELL_SIZE, CELL_SIZE), 1)
+                pygame.draw.rect(self.screen, color, (x, y, cell_size, cell_size))
+                pygame.draw.rect(self.screen, GRID_COLOR, (x, y, cell_size, cell_size), 1)
 
         # Draw tagger (filled red circle)
         tr, tc = int(gs.tagger_pos[0]), int(gs.tagger_pos[1])
-        tx = gx0 + tc * CELL_SIZE + CELL_SIZE // 2
-        ty = gy0 + tr * CELL_SIZE + CELL_SIZE // 2
-        pygame.draw.circle(self.screen, TAGGER_COLOR, (tx, ty), CELL_SIZE // 2 - 4)
+        tx = gx0 + tc * cell_size + cell_size // 2
+        ty = gy0 + tr * cell_size + cell_size // 2
+        pygame.draw.circle(self.screen, TAGGER_COLOR, (tx, ty), max(4, cell_size // 2 - 4))
         # Label: T
         label_surf = self.font.render("T", True, (255, 255, 255))
         self.screen.blit(label_surf, label_surf.get_rect(center=(tx, ty)))
 
         # Draw runner (filled blue circle)
         rr, rc = int(gs.runner_pos[0]), int(gs.runner_pos[1])
-        rx = gx0 + rc * CELL_SIZE + CELL_SIZE // 2
-        ry = gy0 + rr * CELL_SIZE + CELL_SIZE // 2
-        pygame.draw.circle(self.screen, RUNNER_COLOR, (rx, ry), CELL_SIZE // 2 - 4)
+        rx = gx0 + rc * cell_size + cell_size // 2
+        ry = gy0 + rr * cell_size + cell_size // 2
+        pygame.draw.circle(self.screen, RUNNER_COLOR, (rx, ry), max(4, cell_size // 2 - 4))
         # Label: R
         label_surf = self.font.render("R", True, (255, 255, 255))
         self.screen.blit(label_surf, label_surf.get_rect(center=(rx, ry)))
 
         # Info bar
-        info_y = WINDOW_H - INFO_HEIGHT
-        pygame.draw.rect(self.screen, INFO_BG, (0, info_y, WINDOW_W, INFO_HEIGHT))
+        info_y = h - info_h
+        pygame.draw.rect(self.screen, INFO_BG, (0, info_y, w, info_h))
         info_text = f"Step: {step:3d}/{MAX_STEPS}   {label}"
         text_surf = self.font.render(info_text, True, TEXT_COLOR)
         self.screen.blit(text_surf, (MARGIN, info_y + 10))
@@ -174,6 +185,11 @@ class TagRenderer:
                 return False
             if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                 return False
+            if event.type == pygame.VIDEORESIZE:
+                # pygame 1.x: must recreate the surface on resize
+                self.screen = pygame.display.set_mode(
+                    event.size, pygame.RESIZABLE
+                )
         return True
 
     def capture_frame(self) -> np.ndarray:
@@ -244,7 +260,7 @@ def render_episode(
             t_action, _ = tagger_model.predict(t_obs, deterministic=deterministic)
             t_action = int(t_action)
         else:
-            import random; t_action = random.randint(0, 4)
+            import random; t_action = random.randint(0, 8)
 
         if runner_model is not None:
             r_action, _ = runner_model.predict(r_obs, deterministic=deterministic)

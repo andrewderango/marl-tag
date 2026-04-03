@@ -14,8 +14,11 @@ action is computed inside step() so SB3 only sees a standard single-agent MDP.
    This avoids synchronisation bugs that arise when two separate envs would drift.
 
 2. Flat observation vector (MlpPolicy, not CNN)
-   We encode all task-relevant information explicitly in 11 dimensions:
-     [own_row_n, own_col_n, lk_opp_row_n, lk_opp_col_n, own_dr, own_dc,
+   We encode all task-relevant information explicitly:
+     Tagger (15-dim): [own_row_n, own_col_n, lk_opp_row_n, lk_opp_col_n, own_dr, own_dc,
+      can_move_up, can_move_down, can_move_left, can_move_right,
+      can_move_ul, can_move_ur, can_move_dl, can_move_dr, opp_visible]
+     Runner (11-dim): [own_row_n, own_col_n, lk_opp_row_n, lk_opp_col_n, own_dr, own_dc,
       can_move_up, can_move_down, can_move_left, can_move_right, opp_visible]
    A CNN over raw 12×12 pixels would need many more samples to learn positional
    features from scratch, and the grid is small enough that explicit coordinates
@@ -72,11 +75,14 @@ from collections import deque
 # Constants
 # ---------------------------------------------------------------------------
 
-GRID_SIZE = 12   # 12×12 grid; border cells are walls; interior is 10×10
-MAX_STEPS = 100  # episode length cap; runner "wins" if this is reached
+GRID_SIZE = 20   # 20×20 grid; border cells are walls; interior is 18×18
+MAX_STEPS = 150  # episode length cap; runner "wins" if this is reached
 
 N_ACTIONS = 5
 OBS_DIM   = 11   # 6 scalars (own pos, lk opp pos, velocity) + 4 movement flags + 1 visibility flag
+
+TAGGER_N_ACTIONS = 9    # 8 directions (4 cardinal + 4 diagonal) + STAY
+TAGGER_OBS_DIM   = 15   # 6 scalars + 8 movement flags + 1 visibility flag
 
 # Tagger reward shaping constants
 SHAPING_GAMMA   = 0.99   # must match PPO gamma
@@ -88,15 +94,29 @@ REVISIT_WINDOW  = 8      # number of recent tagger positions tracked for loop de
 # Runner reward shaping constants
 RUNNER_STAY_PENALTY = -0.1  # penalty for runner choosing STAY (discourage standing still)
 
-# Interior obstacles: 11 cells.
-# Creates 2 corner hiding spots (L-blocks) and 1 horizontal chokepoint bar.
+# Interior obstacles: ~35 cells.
+# Creates 4 corner hideouts (L-blocks), 2 horizontal chokepoints, and 1 vertical bar.
 INTERIOR_OBSTACLES = [
-    # SW L-block
-    (8, 2), (9, 2), (9, 3),
-    # SE L-block
-    (7, 7), (7, 8), (7, 9), (8, 9), (9, 8), (9, 9),
-    # North chokepoint bar
-    (4, 4), (4, 5), (3, 5), (4, 6), (5, 6), (4, 7),
+    # Upper right corner room
+    (1, 10), (2, 10), (3, 10), (4, 10), (5, 10), (5, 11), (5, 12), (5, 13), (5, 14), (5, 15), (5, 16), (5, 17),
+    (2, 12), (3, 12), (3, 13), (3, 14), (3, 15), (3, 16), (3, 17), (3, 18),
+    (1, 17), (2, 9),
+
+    # Upper left corner
+    (2, 2), (2, 3), (2, 4), (3, 2), (4, 2), (5, 2), (5, 3), (5, 4),
+
+    # Bottom bar
+    (17, 2), (17, 3), (17, 4), (17, 5), (17, 7), (17, 8), (17, 9), (17, 10), (17, 11), (17, 12), (17, 13), (17, 14), (17, 15), (17, 16), (17, 17),
+
+    # Middle islands
+    (13, 3), (12, 3), (12, 4), (11, 4), (12, 5), (12, 6), (11, 6), (13, 6), 
+    (8, 9), (9, 9), (10, 9), (8, 10), (9, 10), (10, 10), (8, 11), (9, 11), (10, 11), (8, 12), (9, 12), (10, 12), (8, 13), (9, 13), (10, 13),
+
+    # Middle blocks
+    (14, 8), (14, 9), (15, 8),
+    (13, 11),
+    (15, 13),
+    (13, 15), (14, 16),
 ]
 
 # Action index → (delta_row, delta_col)
@@ -107,6 +127,10 @@ ACTIONS = {
     2: ( 0, -1),   # LEFT
     3: ( 0,  1),   # RIGHT
     4: ( 0,  0),   # STAY
+    5: (-1, -1),   # UP-LEFT   (tagger only)
+    6: (-1,  1),   # UP-RIGHT  (tagger only)
+    7: ( 1, -1),   # DOWN-LEFT (tagger only)
+    8: ( 1,  1),   # DOWN-RIGHT (tagger only)
 }
 
 
@@ -193,14 +217,15 @@ class GridState:
                 error += dr
         return True
 
-    def _get_movement_flags(self, pos: np.ndarray) -> np.ndarray:
+    def _get_movement_flags(self, pos: np.ndarray, n_dirs: int = 4) -> np.ndarray:
         """
-        Return a 4-element float32 array indicating passability in cardinal directions.
-        [can_move_up, can_move_down, can_move_left, can_move_right]
+        Return a float32 array of length n_dirs indicating passability.
+        n_dirs=4 → cardinal directions only (UP, DOWN, LEFT, RIGHT).
+        n_dirs=8 → cardinals plus diagonals (UP-LEFT, UP-RIGHT, DOWN-LEFT, DOWN-RIGHT).
         Each value is 1.0 (passable) or 0.0 (wall blocks movement).
         """
         flags = []
-        for action in range(4):  # UP, DOWN, LEFT, RIGHT
+        for action in range(n_dirs):
             dr, dc = ACTIONS[action]
             candidate = pos + np.array([dr, dc], dtype=np.int32)
             candidate = np.clip(candidate, 0, self.grid_size - 1)
@@ -344,9 +369,10 @@ class GridState:
 
     def get_tagger_obs(self) -> np.ndarray:
         """
-        Tagger's observation vector (float32, shape (OBS_DIM,) = (11,)):
+        Tagger's observation vector (float32, shape (TAGGER_OBS_DIM,) = (15,)):
           [own_row_n, own_col_n, lk_runner_row_n, lk_runner_col_n, own_dr, own_dc,
-           can_move_up, can_move_down, can_move_left, can_move_right, opp_visible]
+           can_move_up, can_move_down, can_move_left, can_move_right,
+           can_move_ul, can_move_ur, can_move_dl, can_move_dr, opp_visible]
 
         Positions are normalised to [0, 1] by dividing by (grid_size − 1).
         Velocity components are in {−1, 0, 1} (raw deltas, already small).
@@ -372,7 +398,7 @@ class GridState:
 
         dr = float(self.tagger_last_d[0])
         dc = float(self.tagger_last_d[1])
-        move_flags = self._get_movement_flags(self.tagger_pos)
+        move_flags = self._get_movement_flags(self.tagger_pos, n_dirs=8)
         return np.concatenate([[own_r, own_c, lk_r, lk_c, dr, dc], move_flags, [visible]]).astype(np.float32)
 
     def get_runner_obs(self) -> np.ndarray:
@@ -432,12 +458,12 @@ class TaggerEnv(gym.Env):
         self.grid_state     = GridState(grid_size=grid_size, seed=seed)
         self.opponent_model = None   # frozen RunnerModel; None → uniform random
 
-        self.action_space = spaces.Discrete(N_ACTIONS)
+        self.action_space = spaces.Discrete(TAGGER_N_ACTIONS)
 
         # Bounds: normalised positions ∈ [0,1], masked to −1; velocity ∈ {−1,0,1};
         # wall patch ∈ {0,1}.  Using [−1, 1] as a universal safe bound.
-        low  = np.full(OBS_DIM, -1.0, dtype=np.float32)
-        high = np.full(OBS_DIM,  1.0, dtype=np.float32)
+        low  = np.full(TAGGER_OBS_DIM, -1.0, dtype=np.float32)
+        high = np.full(TAGGER_OBS_DIM,  1.0, dtype=np.float32)
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
 
     def set_opponent(self, model) -> None:
@@ -532,9 +558,9 @@ if __name__ == "__main__":
     obs, info = tagger_env.reset()
     print(f"obs shape : {obs.shape}  dtype: {obs.dtype}")
     print(f"obs[:6]   : {obs[:6]}  (own_r, own_c, lk_opp_r, lk_opp_c, dr, dc)")
-    print(f"obs[6:10] : {obs[6:10]}  (movement flags: up, down, left, right)")
-    print(f"obs[10]   : {obs[10]}  (opp_visible)")
-    assert obs.shape == (OBS_DIM,), f"Expected ({OBS_DIM},), got {obs.shape}"
+    print(f"obs[6:14] : {obs[6:14]}  (movement flags: up, down, left, right, ul, ur, dl, dr)")
+    print(f"obs[14]   : {obs[14]}  (opp_visible)")
+    assert obs.shape == (TAGGER_OBS_DIM,), f"Expected ({TAGGER_OBS_DIM},), got {obs.shape}"
 
     total_r = 0.0
     for step_i in range(1, MAX_STEPS + 2):

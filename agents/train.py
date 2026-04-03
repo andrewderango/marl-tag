@@ -4,6 +4,7 @@ agents/train.py — Alternating PPO self-play training loop.
 Usage:
     python agents/train.py [--num_cycles N] [--steps_per_cycle S]
                            [--snapshot_freq F] [--seed SEED]
+                           [--resume_from CYCLE]
 
 Key design decisions documented here for the report:
 
@@ -96,6 +97,12 @@ def parse_args():
         help="Root directory for TensorBoard logs (default: ./tensorboard_logs/).",
     )
     p.add_argument(
+        "--resume_from", type=int, default=0,
+        help="Resume training from this cycle number. Loads tagger_NNNN and "
+             "runner_NNNN snapshots from --snapshots_dir and starts from cycle+1 "
+             "(default: 0, i.e. fresh start).",
+    )
+    p.add_argument(
         "--check_env", action="store_true",
         help="Run SB3's check_env() on both envs before training and exit.",
     )
@@ -186,37 +193,52 @@ def main():
         print("[PASS] Both envs pass SB3 check_env()")
         return
 
-    # --- Create PPO models ---
+    # --- Create or resume PPO models ---
     # Each model is tied to its own env.  SB3 wraps the env in a DummyVecEnv
     # internally; our set_opponent() calls modify the env object in-place, which
     # propagates to the wrapped env since they share the same object reference.
-    tagger_model = make_ppo(tagger_env, args.n_steps, args.tb_log_dir, args.seed,     "tagger")
-    runner_model = make_ppo(runner_env, args.n_steps, args.tb_log_dir, args.seed + 1, "runner")
+    start_cycle = args.resume_from + 1
+
+    if args.resume_from > 0:
+        tagger_snap = os.path.join(args.snapshots_dir, f"tagger_{args.resume_from:04d}")
+        runner_snap = os.path.join(args.snapshots_dir, f"runner_{args.resume_from:04d}")
+        for path in (tagger_snap + ".zip", runner_snap + ".zip"):
+            if not os.path.exists(path):
+                raise FileNotFoundError(
+                    f"Resume snapshot not found: {path}\n"
+                    f"Available snapshots in {args.snapshots_dir}/: "
+                    + ", ".join(sorted(os.listdir(args.snapshots_dir)))
+                )
+        tagger_model = PPO.load(tagger_snap, env=tagger_env)
+        runner_model = PPO.load(runner_snap, env=runner_env)
+        print(f"Resumed from cycle {args.resume_from}: "
+              f"{tagger_snap}.zip, {runner_snap}.zip")
+    else:
+        tagger_model = make_ppo(tagger_env, args.n_steps, args.tb_log_dir, args.seed,     "tagger")
+        runner_model = make_ppo(runner_env, args.n_steps, args.tb_log_dir, args.seed + 1, "runner")
 
     print(f"\n{'='*60}")
-    print(f"Training: {args.num_cycles} cycles, "
+    print(f"Training: cycles {start_cycle}–{args.num_cycles}, "
           f"{args.steps_per_cycle} steps/cycle/agent, "
           f"snapshots every {args.snapshot_freq} cycles")
-    print(f"Total env steps (approx): "
-          f"{2 * args.num_cycles * args.steps_per_cycle:,}")
-    print(f"Expected snapshots: "
-          f"{args.num_cycles // args.snapshot_freq + 1}")
+    print(f"Remaining env steps (approx): "
+          f"{2 * (args.num_cycles - args.resume_from) * args.steps_per_cycle:,}")
     print(f"{'='*60}\n")
 
     # --- Snapshot cycle 0 (untrained / random baseline) ---
-    # This is important: the evaluator needs a "cycle 0" snapshot to anchor the
-    # co-evolution plot at the random-policy baseline.
-    snap0_runner = os.path.join(args.snapshots_dir, "runner_0000")
-    snap0_tagger = os.path.join(args.snapshots_dir, "tagger_0000")
-    runner_model.save(snap0_runner)
-    tagger_model.save(snap0_tagger)
-    print(f"[Cycle 0] Saved initial (random) snapshots: "
-          f"{snap0_runner}.zip, {snap0_tagger}.zip")
+    # Skipped when resuming — the existing snapshots are already on disk.
+    if args.resume_from == 0:
+        snap0_runner = os.path.join(args.snapshots_dir, "runner_0000")
+        snap0_tagger = os.path.join(args.snapshots_dir, "tagger_0000")
+        runner_model.save(snap0_runner)
+        tagger_model.save(snap0_tagger)
+        print(f"[Cycle 0] Saved initial (random) snapshots: "
+              f"{snap0_runner}.zip, {snap0_tagger}.zip")
 
     # --- Alternating training ---
     train_start = time.time()
 
-    for cycle in range(1, args.num_cycles + 1):
+    for cycle in range(start_cycle, args.num_cycles + 1):
         cycle_start = time.time()
 
         # --- Step 1: Update runner, tagger frozen ---
