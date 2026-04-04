@@ -48,8 +48,10 @@ action is computed inside step() so SB3 only sees a standard single-agent MDP.
    Tagger: +10 on catch, −0.1/step time penalty, plus three shaping components:
      (a) Potential-based distance shaping: F = γ·Φ(s') − Φ(s), Φ(s) = −dist.
          Provides a dense gradient toward the runner each step without altering
-         the optimal policy (Ng et al., 1999).
-     (b) STAY action penalty (−0.5): breaks standstill equilibria where the
+         the optimal policy (Ng et al., 1999). Weight 0.3 (reduced from 0.5)
+         because Manhattan distance ignores walls; too high a weight pulls the
+         tagger through walls and produces a misleading gradient.
+     (b) STAY action penalty (−0.3): breaks standstill equilibria where the
          tagger avoids negative expected reward by doing nothing.
      (c) Revisit penalty (−0.2): penalises returning to a recently-visited cell,
          breaking 2-step loop traps common in early self-play training.
@@ -59,6 +61,9 @@ action is computed inside step() so SB3 only sees a standard single-agent MDP.
          from the tagger each step without altering the optimal policy.
      (b) STAY action penalty (−0.1): discourages standing still when the tagger
          approaches, which is the dominant failure mode without this signal.
+   Terminal reward ratio: at MAX_STEPS=200, total survival reward ≈ 200.
+   Catch bonus (+10) / penalty (−10) ≈ 10 steps' worth — large enough to be
+   decisive but not so large that it swamps the per-step shaping signal.
 
 6. Simultaneous movement
    Both agents move at the same time each step. Sequential movement would give a
@@ -76,7 +81,7 @@ from collections import deque
 # ---------------------------------------------------------------------------
 
 GRID_SIZE = 20   # 20×20 grid; border cells are walls; interior is 18×18
-MAX_STEPS = 100  # episode length cap; runner "wins" if this is reached
+MAX_STEPS = 200  # episode length cap; runner "wins" if this is reached
 
 N_ACTIONS = 5
 OBS_DIM   = 11   # 6 scalars (own pos, lk opp pos, velocity) + 4 movement flags + 1 visibility flag
@@ -86,8 +91,8 @@ TAGGER_OBS_DIM   = 15   # 6 scalars + 8 movement flags + 1 visibility flag
 
 # Tagger reward shaping constants
 SHAPING_GAMMA   = 0.99   # must match PPO gamma
-SHAPING_SCALE   = 0.5    # weight on potential-based distance shaping
-STAY_PENALTY    = -0.5   # extra penalty for tagger choosing STAY (action 4)
+SHAPING_SCALE   = 0.3    # weight on potential-based distance shaping (reduced: Manhattan dist ignores walls)
+STAY_PENALTY    = -0.3   # extra penalty for tagger choosing STAY (action 4)
 REVISIT_PENALTY = -0.2   # penalty for tagger returning to a recently-visited cell
 REVISIT_WINDOW  = 8      # number of recent tagger positions tracked for loop detection
 
@@ -273,60 +278,42 @@ class GridState:
         Apply both actions simultaneously, update positions, check termination.
         Returns (tagger_reward, runner_reward, terminated, truncated, info).
 
-        Simultaneous movement: both intended moves are resolved at the same time.
-        This prevents first-mover advantages and matches the spirit of the game.
+        Simultaneous movement: both agents' intended moves are resolved before
+        any catch check. This prevents first-mover advantages — the runner can
+        dodge the tagger's final approach step.
 
         Tagger reward = −0.1 (time penalty)
                       + γ·Φ(s') − Φ(s)  where Φ(s) = −dist  (potential-based shaping)
                       + STAY_PENALTY if action == STAY  (break standstill equilibria)
                       + REVISIT_PENALTY if new cell was recently visited  (break loops)
-                      + 20.0 on catch
-        Runner reward = +0.5 (survival)
+                      + 10.0 on catch
+        Runner reward = +1.0 (survival)
                       + γ·dist_after − dist_before  (potential-based escape shaping)
                       + RUNNER_STAY_PENALTY if action == STAY  (discourage standing still)
-                      − 20.0 on catch
-                      + 15.0 on episode timeout (survived to end)
+                      − 10.0 on catch
         """
         assert not self.done, "step() called on a finished episode — call reset() first"
 
         dist_before = float(np.sum(np.abs(self.tagger_pos - self.runner_pos)))
 
-        # === TAGGER MOVES FIRST ===
+        # === BOTH AGENTS MOVE SIMULTANEOUSLY ===
+        # Compute both new positions before applying either, so neither agent
+        # sees the other's updated position when choosing its move.
         new_tagger, t_delta = self._try_move(self.tagger_pos, tagger_action)
-        self.tagger_pos = new_tagger
-        self.tagger_last_d = t_delta
-
-        # Check if tagger caught runner on its move
-        if np.array_equal(self.tagger_pos, self.runner_pos):
-            self.step_count += 1
-            self.done = True
-            self.tagger_won = True
-            tagger_reward = 20.0 - 0.1  # catch bonus + time penalty
-            runner_reward = 0.5 - 20.0  # survival bonus + catch penalty
-            if tagger_action == 4:
-                tagger_reward += STAY_PENALTY
-            info = {
-                "tagged": True,
-                "timed_out": False,
-                "step_count": self.step_count,
-                "tagger_won": True,
-                "runner_won": False,
-            }
-            return tagger_reward, runner_reward, True, False, info
-
-        # === RUNNER MOVES SECOND ===
         new_runner, r_delta = self._try_move(self.runner_pos, runner_action)
-        self.runner_pos = new_runner
-        self.runner_last_d = r_delta
-        self.step_count += 1
 
-        # Check if tagger caught runner after runner moved
-        tagged = bool(np.array_equal(self.tagger_pos, self.runner_pos))
+        self.tagger_pos    = new_tagger
+        self.tagger_last_d = t_delta
+        self.runner_pos    = new_runner
+        self.runner_last_d = r_delta
+        self.step_count   += 1
+
+        tagged    = bool(np.array_equal(self.tagger_pos, self.runner_pos))
         timed_out = self.step_count >= MAX_STEPS
 
         # Base per-step rewards
         tagger_reward = -0.1   # time penalty: tagger must actively pursue
-        runner_reward = 0.5    # survival bonus: runner wants to last as long as possible
+        runner_reward =  1.0   # survival bonus: runner wants to last as long as possible
 
         # Potential-based distance shaping — dense chase/escape signals.
         # F(s, s') = γ·Φ(s') − Φ(s), Φ(s) = −dist preserves the optimal policy.
@@ -348,24 +335,23 @@ class GridState:
         self._tagger_pos_history.append(tagger_pos_key)
 
         if tagged:
-            tagger_reward += 20.0
-            runner_reward += -20.0
+            tagger_reward += 10.0
+            runner_reward += -10.0
             self.tagger_won = True
             self.done = True
 
         terminated = tagged
-        truncated = (not tagged) and timed_out
+        truncated  = (not tagged) and timed_out
         if truncated:
-            runner_reward += 15.0  # terminal survival bonus: reward making it to the end
             self.runner_won = True
             self.done = True
 
         info = {
-            "tagged": tagged,
-            "timed_out": timed_out,
-            "step_count": self.step_count,
-            "tagger_won": self.tagger_won,
-            "runner_won": self.runner_won,
+            "tagged":      tagged,
+            "timed_out":   timed_out,
+            "step_count":  self.step_count,
+            "tagger_won":  self.tagger_won,
+            "runner_won":  self.runner_won,
         }
         return tagger_reward, runner_reward, terminated, truncated, info
 
@@ -535,7 +521,7 @@ class RunnerEnv(gym.Env):
             tagger_action, _ = self.opponent_model.predict(tagger_obs, deterministic=False)
             tagger_action = int(tagger_action)
         else:
-            tagger_action = self.action_space.sample()
+            tagger_action = int(self.grid_state.rng.integers(0, TAGGER_N_ACTIONS))
 
         _, runner_reward, terminated, truncated, info = self.grid_state.step(
             tagger_action, int(runner_action)
