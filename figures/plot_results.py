@@ -115,27 +115,27 @@ def plot_coevolution(results_dir: str, output_dir: str) -> None:
 
     # Curve A: runner vs historical taggers (should increase)
     ax.plot(
-        df_A["snapshot_cycle"], df_A["mean_duration"],
+        df_A["snapshot_cycle"], df_A["mean_tags"],
         color=RUNNER_COLOR, linestyle="-", linewidth=2,
         marker="o", markersize=4, label="Latest runner vs historical tagger",
     )
     ax.fill_between(
         df_A["snapshot_cycle"],
-        df_A["mean_duration"] - df_A["std_duration"],
-        df_A["mean_duration"] + df_A["std_duration"],
+        df_A["mean_tags"] - df_A["std_duration"],
+        df_A["mean_tags"] + df_A["std_duration"],
         color=RUNNER_COLOR, alpha=0.15,
     )
 
     # Curve B: tagger vs historical runners (should decrease)
     ax.plot(
-        df_B["snapshot_cycle"], df_B["mean_duration"],
+        df_B["snapshot_cycle"], df_B["mean_tags"],
         color=TAGGER_COLOR, linestyle="--", linewidth=2,
         marker="s", markersize=4, label="Latest tagger vs historical runner",
     )
     ax.fill_between(
         df_B["snapshot_cycle"],
-        df_B["mean_duration"] - df_B["std_duration"],
-        df_B["mean_duration"] + df_B["std_duration"],
+        df_B["mean_tags"] - df_B["std_duration"],
+        df_B["mean_tags"] + df_B["std_duration"],
         color=TAGGER_COLOR, alpha=0.15,
     )
 
