@@ -1,16 +1,27 @@
 """
-figures/plot_heatmaps.py — Position heatmaps for seeker and hider over training.
+figures/plot_heatmaps.py — Emergent behavior visualization via Log-Scale Heatmaps.
 
 Usage:
     python figures/plot_heatmaps.py [--snapshots_dir DIR] [--output_dir DIR]
+                                   [--initial N] [--middle N] [--final N]
                                    [--n_episodes N] [--deterministic]
 
-This script generates two rows of heatmaps:
-  - top row: seeker (tagger) occupancy at 10%, 50%, 100% of training
-  - bottom row: hider (runner) occupancy at the same stages
+This script generates a 2x3 grid of occupancy heatmaps comparing Seeker (Tagger)
+and Hider (Runner) behaviors at three distinct stages of training.
 
-The resulting figure illustrates the transition from wide exploration to
-concentrated hotspots as policies become more strategic.
+Key Features:
+  - Logarithmic Scaling: Uses LogNorm to ensure low-density exploration paths 
+    are visible alongside high-density strategic hotspots.
+  - Robust Selection: Automatically finds the nearest available .zip snapshots 
+    to the requested cycles, handling asynchronous save intervals.
+  - Flexible Timing:
+      - Default: Picks 10%, 50%, and 100% of the latest available snapshot.
+      - Anchored: Providing --final 1000 scales others to 100 and 500 automatically.
+      - Manual: Explicitly set --initial, --middle, or --final to compare specific 
+        points of interest (e.g., before/after a strategy shift).
+
+The resulting figure illustrates the transition from high-entropy random walks 
+to structured, emergent coordination and environmental exploitation.
 """
 
 import argparse
@@ -68,6 +79,19 @@ def parse_args():
         "--seed", type=int, default=0,
         help="Base random seed for episode sampling.",
     )
+    # New arguments for specific cycle control
+    p.add_argument(
+        "--initial", type=int, 
+        help="Specific cycle for the first heatmap.",
+    )
+    p.add_argument(
+        "--middle", type=int, 
+        help="Specific cycle for the second heatmap.",
+    )
+    p.add_argument(
+        "--final", type=int, 
+        help="Specific cycle for the third heatmap.",
+    )
     return p.parse_args()
 
 
@@ -106,6 +130,20 @@ def choose_snapshot_at_fraction(snapshots: dict, fraction: float) -> tuple:
     chosen_cycle = min(cycles, key=lambda c: abs(c - target))
     return snapshots[chosen_cycle], chosen_cycle
 
+def find_closest_cycle(snapshots: dict, target: int, prefix: str = "") -> tuple:
+    """Finds the existing snapshot key closest to the target integer."""
+    if not snapshots:
+        raise FileNotFoundError(f"No {prefix} snapshots found.")
+    
+    cycles = sorted(snapshots.keys())
+    chosen_cycle = min(cycles, key=lambda c: abs(c - target))
+    
+    # Calculate the 'drift' from the user's requested target
+    offset = abs(chosen_cycle - target)
+    if offset > 0:
+        print(f"  [INFO] Requested {prefix} {target}, using closest available: {chosen_cycle} (offset: {offset})")
+        
+    return snapshots[chosen_cycle], chosen_cycle
 
 def load_model(path: str, env):
     return PPO.load(path, env=env)
@@ -212,22 +250,43 @@ def main():
     tagger_snapshots = find_snapshots(args.snapshots_dir, "tagger")
     runner_snapshots = find_snapshots(args.snapshots_dir, "runner")
 
-    fractions = [0.1, 0.5, 1.0]
-    labels = ["10% training", "50% training", "100% training"]
+    # Determine reference points
+    max_available = max(tagger_snapshots.keys())
+    final_target = args.final if args.final is not None else max_available
 
+    # Determine target cycles for all three columns
+    # If --final is set but others aren't, they scale proportionally (10%, 50%)
+    target_cycles = [
+            args.initial if args.initial is not None else int(final_target * 0.1),
+            args.middle if args.middle is not None else int(final_target * 0.5),
+            final_target
+        ]
+    
+    # 3. Generate dynamic labels
+    # If user provided any specific cycle args, use "Cycle N" labels. 
+    # Otherwise, stick to the percentage labels.
     seeker_maps = []
     hider_maps = []
+    actual_labels = [] # We will build labels based on what we actually fin
 
-    # Use a single wall mask from a fresh env so the plot can hide obstacles.
     wall_mask = TaggerEnv(seed=args.seed).grid_state.walls.astype(bool)
 
-    for frac in fractions:
-        tagger_path, tagger_cycle = choose_snapshot_at_fraction(tagger_snapshots, frac)
-        runner_path, runner_cycle = choose_snapshot_at_fraction(runner_snapshots, frac)
-        print(f"Stage {frac:.0%}: tagger cycle {tagger_cycle}, runner cycle {runner_cycle}")
+    for i, target in enumerate(target_cycles):
+        # Find the actual files closest to our targets
+        t_path, t_actual = find_closest_cycle(tagger_snapshots, target, "Tagger")
+        r_path, r_actual = find_closest_cycle(runner_snapshots, target, "Runner")
+        
+        # Robustness Check: Are the agents significantly out of sync?
+        if abs(t_actual - r_actual) > 0:
+            print(f"  [WARNING] Agent Mismatch at Stage {i+1}: Seeker is {t_actual}, Hider is {r_actual}")
 
-        tagger_model = load_model(tagger_path, TaggerEnv(seed=args.seed))
-        runner_model = load_model(runner_path, RunnerEnv(seed=args.seed + 1))
+        print(f"Target {target} -> Using: Tagger {t_actual}, Runner {r_actual}")
+
+        # Update the label to show the ACTUAL cycle used
+        actual_labels.append(f"Cycle {t_actual}")
+
+        tagger_model = load_model(t_path, TaggerEnv(seed=args.seed))
+        runner_model = load_model(r_path, RunnerEnv(seed=args.seed + 1))
 
         seeker_counts = collect_position_counts(
             active_model=tagger_model,
@@ -237,7 +296,7 @@ def main():
             position_attr="tagger_pos",
             n_episodes=args.n_episodes,
             deterministic=args.deterministic,
-            seed=args.seed + int(frac * 10),
+            seed=args.seed + target,
         )
         hider_counts = collect_position_counts(
             active_model=runner_model,
@@ -247,14 +306,16 @@ def main():
             position_attr="runner_pos",
             n_episodes=args.n_episodes,
             deterministic=args.deterministic,
-            seed=args.seed + int(frac * 10) + 100,
+            seed=args.seed + target + 100,
         )
 
         seeker_maps.append(normalize_counts(seeker_counts))
         hider_maps.append(normalize_counts(hider_counts))
 
     print("Plotting heatmaps...")
-    plot_heatmaps(fractions, labels, seeker_maps, hider_maps, wall_mask, args.output_dir)
+    # Passing target_cycles as fractions just to satisfy the plot_heatmaps signature, 
+    # though only labels are used for the UI.
+    plot_heatmaps(target_cycles, actual_labels, seeker_maps, hider_maps, wall_mask, args.output_dir)
     print("Done.")
 
 
