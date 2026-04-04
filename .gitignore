@@ -2,6 +2,7 @@ CLAUDE.md
 
 # Training outputs (large files)
 snapshots/
+snapshots2/
 tensorboard_logs/
 results/
 figures/output/
