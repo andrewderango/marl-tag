@@ -65,8 +65,8 @@ def parse_args():
         description="Train tagger and runner via alternating PPO self-play."
     )
     p.add_argument(
-        "--num_cycles", type=int, default=200,
-        help="Number of alternating training cycles (default: 200). "
+        "--num_cycles", type=int, default=500,
+        help="Number of alternating training cycles (default: 500). "
              "Total env steps ≈ 2 × num_cycles × steps_per_cycle.",
     )
     p.add_argument(
@@ -80,9 +80,9 @@ def parse_args():
              "update (default: 1024).  steps_per_cycle must be a multiple.",
     )
     p.add_argument(
-        "--snapshot_freq", type=int, default=8,
-        help="Save snapshots every N cycles (default: 8). "
-             "With 200 cycles this gives 25 snapshots — within the 20-30 target.",
+        "--snapshot_freq", type=int, default=10,
+        help="Save snapshots every N cycles (default: 10). "
+             "With 500 cycles this gives 50 snapshots.",
     )
     p.add_argument(
         "--seed", type=int, default=42,
@@ -131,9 +131,11 @@ def make_ppo(env, n_steps: int, tb_log_dir: str, seed: int, role: str) -> PPO:
     """
     Create a PPO model with the hyperparameters from CLAUDE.md.
 
-    ent_coef=0.01: entropy bonus keeps exploration alive during early training.
-    Without it the policy collapses to near-deterministic behaviour before the
-    opponent is interesting, and both agents get stuck in a local equilibrium.
+    ent_coef=0.025: entropy bonus sustains exploration in self-play, where
+    the opponent changes every cycle. At 0.01 the policy collapses to near-
+    deterministic behaviour before the opponent is interesting, preventing
+    adaptation to novel strategies. 0.025 keeps the policy stochastic longer
+    without sacrificing convergence speed as much as 0.03.
 
     gamma=0.99: long discount horizon is appropriate because catching/evading
     takes up to MAX_STEPS=200 steps.  A shorter horizon (e.g. 0.95) would
@@ -147,7 +149,7 @@ def make_ppo(env, n_steps: int, tb_log_dir: str, seed: int, role: str) -> PPO:
         batch_size=64,
         n_epochs=10,
         gamma=0.99,
-        ent_coef=0.01,
+        ent_coef=0.025,
         verbose=1,
         tensorboard_log=tb_log_dir,
         seed=seed,
