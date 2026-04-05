@@ -80,9 +80,9 @@ def parse_args():
              "update (default: 1024).  steps_per_cycle must be a multiple.",
     )
     p.add_argument(
-        "--snapshot_freq", type=int, default=20,
-        help="Save snapshots every N cycles (default: 20). "
-             "With 500 cycles this gives 25 snapshots — within the 20-30 target.",
+        "--snapshot_freq", type=int, default=10,
+        help="Save snapshots every N cycles (default: 10). "
+             "With 500 cycles this gives 50 snapshots.",
     )
     p.add_argument(
         "--seed", type=int, default=42,

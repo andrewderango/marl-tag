@@ -34,7 +34,7 @@ Key options:
 |---|---|---|
 | `--num_cycles` | 500 | Number of alternating training cycles |
 | `--steps_per_cycle` | 2048 | Env steps per agent per cycle |
-| `--snapshot_freq` | 20 | Save snapshots every N cycles (gives ~25 snapshots at 500 cycles) |
+| `--snapshot_freq` | 10 | Save snapshots every N cycles (gives ~50 snapshots at 500 cycles) |
 | `--seed` | 42 | Random seed |
 | `--resume_from` | 0 | Resume from this cycle (loads snapshots and continues from cycle+1) |
 
@@ -205,7 +205,7 @@ tagRL/
 | Algorithm | PPO (MlpPolicy) | Proximal Policy Optimization, flat vector observations |
 | num_cycles | 500 | Alternating training cycles (~1M steps per agent total) |
 | steps_per_cycle | 2048 | Env steps per agent per cycle (2 PPO updates) |
-| snapshot_freq | 20 | Save every 20 cycles → 25 snapshots |
+| snapshot_freq | 10 | Save every 10 cycles → 50 snapshots |
 | learning_rate | 3e-4 | Adam optimizer |
 | ent_coef | 0.03 | Entropy bonus — sustains exploration in self-play |
 | gamma | 0.99 | Discount factor |
