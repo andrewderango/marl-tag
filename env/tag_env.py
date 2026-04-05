@@ -51,7 +51,7 @@ action is computed inside step() so SB3 only sees a standard single-agent MDP.
          the optimal policy (Ng et al., 1999). Weight 0.3 (reduced from 0.5)
          because Manhattan distance ignores walls; too high a weight pulls the
          tagger through walls and produces a misleading gradient.
-     (b) STAY action penalty (−0.3): breaks standstill equilibria where the
+     (b) STAY action penalty (−0.5): breaks standstill equilibria where the
          tagger avoids negative expected reward by doing nothing.
      (c) Revisit penalty (−0.2): penalises returning to a recently-visited cell,
          breaking 2-step loop traps common in early self-play training.
@@ -92,7 +92,7 @@ TAGGER_OBS_DIM   = 15   # 6 scalars + 8 movement flags + 1 visibility flag
 # Tagger reward shaping constants
 SHAPING_GAMMA   = 0.99   # must match PPO gamma
 SHAPING_SCALE   = 0.3    # weight on potential-based distance shaping (reduced: Manhattan dist ignores walls)
-STAY_PENALTY    = -0.3   # extra penalty for tagger choosing STAY (action 4)
+STAY_PENALTY    = -0.5   # extra penalty for tagger choosing STAY (action 4)
 REVISIT_PENALTY = -0.2   # penalty for tagger returning to a recently-visited cell
 REVISIT_WINDOW  = 8      # number of recent tagger positions tracked for loop detection
 
