@@ -45,7 +45,7 @@ action is computed inside step() so SB3 only sees a standard single-agent MDP.
    from "I just bounced off a wall and am now stationary".
 
 5. Reward design — shaped rewards for both agents for dense learning signals
-   Tagger: +10 on catch, −0.1/step time penalty, plus three shaping components:
+   Tagger: +15 on catch, −0.1/step time penalty, plus three shaping components:
      (a) Potential-based distance shaping: F = γ·Φ(s') − Φ(s), Φ(s) = −dist.
          Provides a dense gradient toward the runner each step without altering
          the optimal policy (Ng et al., 1999). Weight 0.3 (reduced from 0.5)
@@ -55,14 +55,14 @@ action is computed inside step() so SB3 only sees a standard single-agent MDP.
          tagger avoids negative expected reward by doing nothing.
      (c) Revisit penalty (−0.2): penalises returning to a recently-visited cell,
          breaking 2-step loop traps common in early self-play training.
-   Runner: +1/step (survival), −10 on catch, plus two shaping components:
+   Runner: +1/step (survival), −15 on catch, plus two shaping components:
      (a) Potential-based escape shaping: F = γ·dist_after − dist_before.
          Mirror of the tagger's shaping — dense gradient to maximise distance
          from the tagger each step without altering the optimal policy.
      (b) STAY action penalty (−0.1): discourages standing still when the tagger
          approaches, which is the dominant failure mode without this signal.
    Terminal reward ratio: at MAX_STEPS=200, total survival reward ≈ 200.
-   Catch bonus (+10) / penalty (−10) ≈ 10 steps' worth — large enough to be
+   Catch bonus (+15) / penalty (−15) ≈ 15 steps' worth — large enough to be
    decisive but not so large that it swamps the per-step shaping signal.
 
 6. Simultaneous movement
@@ -286,11 +286,11 @@ class GridState:
                       + γ·Φ(s') − Φ(s)  where Φ(s) = −dist  (potential-based shaping)
                       + STAY_PENALTY if action == STAY  (break standstill equilibria)
                       + REVISIT_PENALTY if new cell was recently visited  (break loops)
-                      + 10.0 on catch
+                      + 15.0 on catch
         Runner reward = +1.0 (survival)
                       + γ·dist_after − dist_before  (potential-based escape shaping)
                       + RUNNER_STAY_PENALTY if action == STAY  (discourage standing still)
-                      − 10.0 on catch
+                      − 15.0 on catch
         """
         assert not self.done, "step() called on a finished episode — call reset() first"
 
@@ -335,8 +335,8 @@ class GridState:
         self._tagger_pos_history.append(tagger_pos_key)
 
         if tagged:
-            tagger_reward += 10.0
-            runner_reward += -10.0
+            tagger_reward += 15.0
+            runner_reward += -15.0
             self.tagger_won = True
             self.done = True
 
