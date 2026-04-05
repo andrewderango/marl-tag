@@ -65,10 +65,11 @@ action is computed inside step() so SB3 only sees a standard single-agent MDP.
    Catch bonus (+15) / penalty (−15) ≈ 15 steps' worth — large enough to be
    decisive but not so large that it swamps the per-step shaping signal.
 
-6. Simultaneous movement
-   Both agents move at the same time each step. Sequential movement would give a
-   first-mover advantage (the first-moving agent sees the updated position of the
-   other and can react). Simultaneous movement is fairer and closer to real pursuit.
+6. Sequential movement (tagger-first)
+   The tagger moves first each step; if it steps onto the runner's cell the
+   episode ends immediately without the runner moving. The runner then moves
+   second. This avoids requiring the tagger to predict the runner's next cell
+   to achieve a tag, which caused 3-move cycles in practice.
 """
 
 import numpy as np
@@ -275,12 +276,12 @@ class GridState:
 
     def step(self, tagger_action: int, runner_action: int):
         """
-        Apply both actions simultaneously, update positions, check termination.
-        Returns (tagger_reward, runner_reward, terminated, truncated, info).
+        Apply both actions sequentially (tagger first), update positions, check
+        termination. Returns (tagger_reward, runner_reward, terminated, truncated, info).
 
-        Simultaneous movement: both agents' intended moves are resolved before
-        any catch check. This prevents first-mover advantages — the runner can
-        dodge the tagger's final approach step.
+        Sequential movement (tagger-first): tagger moves and a catch check fires
+        immediately. If the tagger steps onto the runner's cell the episode ends
+        before the runner moves. Otherwise the runner moves second.
 
         Tagger reward = −0.1 (time penalty)
                       + γ·Φ(s') − Φ(s)  where Φ(s) = −dist  (potential-based shaping)
@@ -296,14 +297,30 @@ class GridState:
 
         dist_before = float(np.sum(np.abs(self.tagger_pos - self.runner_pos)))
 
-        # === BOTH AGENTS MOVE SIMULTANEOUSLY ===
-        # Compute both new positions before applying either, so neither agent
-        # sees the other's updated position when choosing its move.
+        # === TAGGER MOVES FIRST ===
         new_tagger, t_delta = self._try_move(self.tagger_pos, tagger_action)
-        new_runner, r_delta = self._try_move(self.runner_pos, runner_action)
-
         self.tagger_pos    = new_tagger
         self.tagger_last_d = t_delta
+
+        # Early catch check: tagger stepped onto runner's cell before runner moves.
+        if np.array_equal(self.tagger_pos, self.runner_pos):
+            self.step_count += 1
+            self.done        = True
+            self.tagger_won  = True
+            tagger_reward    = 15.0 - 0.1   # catch bonus + time penalty
+            runner_reward    = 1.0 - 15.0   # survival bonus + catch penalty
+            if tagger_action == 4:
+                tagger_reward += STAY_PENALTY
+            return tagger_reward, runner_reward, True, False, {
+                "tagged":     True,
+                "timed_out":  False,
+                "step_count": self.step_count,
+                "tagger_won": True,
+                "runner_won": False,
+            }
+
+        # === RUNNER MOVES SECOND ===
+        new_runner, r_delta = self._try_move(self.runner_pos, runner_action)
         self.runner_pos    = new_runner
         self.runner_last_d = r_delta
         self.step_count   += 1
