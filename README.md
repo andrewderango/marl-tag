@@ -207,5 +207,5 @@ tagRL/
 | steps_per_cycle | 2048 | Env steps per agent per cycle (2 PPO updates) |
 | snapshot_freq | 10 | Save every 10 cycles → 50 snapshots |
 | learning_rate | 3e-4 | Adam optimizer |
-| ent_coef | 0.03 | Entropy bonus — sustains exploration in self-play |
+| ent_coef | 0.025 | Entropy bonus — sustains exploration in self-play |
 | gamma | 0.99 | Discount factor |

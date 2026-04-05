@@ -131,10 +131,11 @@ def make_ppo(env, n_steps: int, tb_log_dir: str, seed: int, role: str) -> PPO:
     """
     Create a PPO model with the hyperparameters from CLAUDE.md.
 
-    ent_coef=0.03: higher entropy bonus sustains exploration in self-play, where
+    ent_coef=0.025: entropy bonus sustains exploration in self-play, where
     the opponent changes every cycle. At 0.01 the policy collapses to near-
     deterministic behaviour before the opponent is interesting, preventing
-    adaptation to novel strategies. 0.03 keeps the policy stochastic longer.
+    adaptation to novel strategies. 0.025 keeps the policy stochastic longer
+    without sacrificing convergence speed as much as 0.03.
 
     gamma=0.99: long discount horizon is appropriate because catching/evading
     takes up to MAX_STEPS=200 steps.  A shorter horizon (e.g. 0.95) would
@@ -148,7 +149,7 @@ def make_ppo(env, n_steps: int, tb_log_dir: str, seed: int, role: str) -> PPO:
         batch_size=64,
         n_epochs=10,
         gamma=0.99,
-        ent_coef=0.03,
+        ent_coef=0.025,
         verbose=1,
         tensorboard_log=tb_log_dir,
         seed=seed,
