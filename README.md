@@ -5,7 +5,7 @@
 [![Paper](https://img.shields.io/badge/paper-read%20here-blue)](https://docs.google.com/document/d/1G1IJZz4IaCyTVb-Lp-zXH3I7HMstMcQRCZB8ZQZB5d8)
 
 <p align="center">
-  <img src="output/demo.gif" alt="Tagger (red) chasing Runner (blue) on the 20×20 grid" width="480"/>
+  <img src="figures/output/demo.gif" alt="Tagger (red) chasing Runner (blue) on the 20×20 grid" width="480"/>
 </p>
 
 ---
