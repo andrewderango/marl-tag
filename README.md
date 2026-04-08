@@ -1,211 +1,134 @@
-# tagRL
-Emergent Evasion Strategies via Multi-Agent Self-Play modelled by 2D Apex Predator–Prey interactions.
+# Multi-Agent Reinforcement Learning (MARL) Tag
 
-Two agents — a **tagger** (red) and a **runner** (blue) — are trained via alternating PPO self-play on a 20×20 grid. The tagger tries to catch the runner as fast as possible; the runner tries to survive as long as possible. The core research contribution is a historical evaluation scheme that verifies genuine co-evolution rather than policy cycling.
+*Emergent Pursuit-Evasion Strategies via Adversarial Co-Training*
 
----
+[![Paper](https://img.shields.io/badge/paper-read%20here-blue)](https://docs.google.com/document/d/1G1IJZz4IaCyTVb-Lp-zXH3I7HMstMcQRCZB8ZQZB5d8)
 
-## Install
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-Deactivate when done:
-```bash
-deactivate
-```
+<p align="center">
+  <img src="output/demo.gif" alt="Tagger (red) chasing Runner (blue) on the 20×20 grid" width="480"/>
+</p>
 
 ---
 
-## Workflow
+Can complex pursuit-evasion strategies emerge from scratch, through nothing but competition? This project trains two agents, a **tagger** (red) and a **runner** (blue), on a 20×20 grid using alternating PPO adversarial co-training with no hand-coded heuristics. Over 8 million environment steps, they develop wall exploitation, corner hiding, predictive interception, and sweep search entirely on their own.
 
-### 1. Train
+**Authors:** Hashim Bukhtiar, Andrew De Rango, Ethan Otteson · April 2026 · [Read the paper](https://docs.google.com/document/d/1G1IJZz4IaCyTVb-Lp-zXH3I7HMstMcQRCZB8ZQZB5d8)
 
-```bash
-python agents/train.py
-```
+---
 
-Key options:
+## Goals
 
-| Flag | Default | Description |
+1. Demonstrate emergent strategic behavior in a minimalist 2D environment
+2. Distinguish genuine co-evolution from policy cycling and high-variance learning via round-robin Elo evaluation
+3. Validate PPO stability under non-stationary adversarial co-evolution
+4. Characterize learned behaviors through heatmaps, action profiles, and trajectory rollouts
+
+---
+
+## The Game
+
+Two agents play tag on a discrete **20×20 grid** with fixed border walls and interior obstacles. The tagger moves first each step; if it occupies the runner's cell, the episode ends (tagger wins). If the runner survives **200 steps**, it wins. Neither agent has full information: line-of-sight is blocked by walls (Bresenham's algorithm), so agents must reason from last-known positions and a stale-memory flag.
+
+### Observation Space
+
+| Agent | Dim | Contents |
 |---|---|---|
-| `--num_cycles` | 500 | Number of alternating training cycles |
-| `--steps_per_cycle` | 2048 | Env steps per agent per cycle |
-| `--snapshot_freq` | 10 | Save snapshots every N cycles (gives ~50 snapshots at 500 cycles) |
-| `--seed` | 42 | Random seed |
-| `--resume_from` | 0 | Resume from this cycle (loads snapshots and continues from cycle+1) |
+| Tagger | 15 | Own pos, last-known runner pos, velocity, 8 wall flags, visibility bit |
+| Runner | 11 | Own pos, last-known tagger pos, velocity, 4 wall flags, visibility bit |
 
-Outputs: `snapshots/` (policy `.zip` files) and `tensorboard_logs/` (training curves).
+Positions are normalized to [0, 1]. When the opponent is occluded, the last-known coordinate is reported alongside a binary `opp_visible = 0` flag.
 
-**Resume from a checkpoint:**
-```bash
-python agents/train.py --resume_from 200 --num_cycles 500
-```
+### Action Space
 
-**Monitor training live:**
-```bash
-tensorboard --logdir tensorboard_logs/
-```
-Open `http://localhost:6006/` — watch `ep_len_mean` (runner should increase, tagger should decrease) and `ep_rew_mean` (both should trend upward).
+| Agent | Actions |
+|---|---|
+| Tagger | UP, DOWN, LEFT, RIGHT, UL, UR, DL, DR, STAY (**9 actions**; diagonal moves give a hunting advantage) |
+| Runner | UP, DOWN, LEFT, RIGHT, STAY (**5 actions**) |
 
----
+Wall-blocked moves leave the agent in place.
 
-### 2. Evaluate — co-evolution (main result)
+### Reward Structure
 
-Tests the **latest** trained policy against every historical snapshot. Run after training completes.
-
-```bash
-python eval/evaluate.py --n_episodes 100
-```
-
-Outputs two CSVs to `results/`:
-- `runner_vs_historical_taggers.csv` — latest runner vs each historical tagger
-- `tagger_vs_historical_runners.csv` — latest tagger vs each historical runner
-
-Both curves diverging simultaneously confirms genuine co-evolution.
-
-> **Note:** If you have snapshots from multiple training runs (different observation space sizes), old incompatible snapshots will cause a load error. Delete them first:
-> ```bash
-> # Find and remove incompatible snapshots
-> python -c "
-> import glob
-> from stable_baselines3 import PPO
-> from env.tag_env import TaggerEnv
-> dummy = TaggerEnv(seed=0)
-> for f in sorted(glob.glob('snapshots/tagger_*.zip')):
->     try: PPO.load(f, env=dummy)
->     except: print(f'rm {f}')
-> " 2>/dev/null
-> ```
-
----
-
-### 3. Evaluate — solo learning curves (supplementary)
-
-Tests each **historical** snapshot against the latest (fixed) opponent. Since the opponent doesn't change across the x-axis, any trend reflects only the historical agent's own improvement — less noisy than the co-evolution plot.
-
-```bash
-python eval/evaluate_fixed_opponent.py --n_episodes 100
-```
-
-Outputs to `results/`:
-- `historical_runners_vs_fixed_tagger.csv` — runner skill over training vs best tagger
-- `historical_taggers_vs_fixed_runner.csv` — tagger skill over training vs best runner
-
----
-
-### 4. Plot
-
-Generate all figures from CSVs and TensorBoard logs:
-
-```bash
-python figures/plot_results.py
-```
-
-Saves `.png` and `.pdf` to `figures/output/`:
-- `co_evolution` — main result: two diverging duration curves
-- `training_curves` — episode reward for both agents over training
-- `episode_length` — mean episode length over training (sanity check)
-
-Generate solo learning curve figures (requires step 3 first):
-
-```bash
-python figures/plot_fixed_opponent.py
-```
-
-Saves to `figures/output/`:
-- `runner_solo_learning` — runner improvement vs fixed best tagger
-- `tagger_solo_learning` — tagger improvement vs fixed best runner
-
----
-
-### 5. Render demo
-
-Requires a display. Load any saved snapshot pair and watch a live episode:
-
-```bash
-python render/visualize.py --tagger snapshots/tagger_0500 --runner snapshots/runner_0500
-```
-
-Render and save GIFs for early / mid / late training stages:
-
-```bash
-python render/visualize.py --stages --snapshots_dir snapshots --save_dir output/
-```
-
-Replay all snapshots in cycle order (watch agents evolve):
-
-```bash
-python render/visualize.py --replay --snapshots_dir snapshots
-```
-
----
-
-### 6. Environment sanity check
-
-```bash
-python env/tag_env.py
-```
-
-Steps both envs with random actions and prints observations, rewards, and termination flags.
-
----
-
-## Full pipeline (fresh run)
-
-```bash
-source .venv/bin/activate
-python agents/train.py                              # ~2–3 hours
-python eval/evaluate.py --n_episodes 100            # ~15 min
-python eval/evaluate_fixed_opponent.py --n_episodes 100  # ~15 min
-python figures/plot_results.py
-python figures/plot_fixed_opponent.py
-open figures/output/co_evolution.png
-open figures/output/runner_solo_learning.png
-open figures/output/tagger_solo_learning.png
-```
-
----
-
-## Project structure
-
-```
-tagRL/
-├── env/tag_env.py                    # Gymnasium environments (TaggerEnv, RunnerEnv, GridState)
-├── agents/train.py                   # Alternating PPO training loop
-├── eval/evaluate.py                  # Historical evaluation → co-evolution CSVs
-├── eval/evaluate_fixed_opponent.py   # Fixed-opponent evaluation → solo learning CSVs
-├── figures/plot_results.py           # Co-evolution + training curve figures
-├── figures/plot_fixed_opponent.py    # Solo learning curve figures
-├── render/visualize.py               # Pygame renderer (never imported during training)
-├── snapshots/                        # Saved .zip policy files (one per agent per checkpoint)
-├── results/                          # CSV outputs from evaluators
-└── figures/output/                   # Generated figures (.png and .pdf)
-```
-
-## Key environment parameters
-
-| Parameter | Value | Description |
+| Signal | Tagger | Runner |
 |---|---|---|
-| Grid size | 20×20 | Border walls + interior obstacles |
-| MAX_STEPS | 200 | Episode length cap; runner wins if reached |
-| Tagger actions | 9 | 4 cardinal + 4 diagonal + STAY |
-| Runner actions | 5 | 4 cardinal + STAY |
-| Tagger obs dim | 15 | Position, last-known opponent, velocity, 8 wall flags, visibility |
-| Runner obs dim | 11 | Position, last-known opponent, velocity, 4 wall flags, visibility |
-| Movement | Simultaneous | Both agents move at the same time each step |
+| Per step | −0.1 (time penalty) | +1.0 (survival) |
+| Terminal | +15 on catch | −15 on catch |
+| Shaping | +λ·Δ(−distance) | +λ·Δ(distance) |
+| STAY penalty | −0.5 | −0.1 |
+| Revisit penalty | −0.2 for last 8 cells | — |
 
-## Key training parameters
+Potential-based shaping (Ng et al., 1999) guarantees the shaped and unshaped problems share the same optimal policy with no spurious incentives.
 
-| Parameter | Value | Description |
-|---|---|---|
-| Algorithm | PPO (MlpPolicy) | Proximal Policy Optimization, flat vector observations |
-| num_cycles | 500 | Alternating training cycles (~1M steps per agent total) |
-| steps_per_cycle | 2048 | Env steps per agent per cycle (2 PPO updates) |
-| snapshot_freq | 10 | Save every 10 cycles → 50 snapshots |
-| learning_rate | 3e-4 | Adam optimizer |
-| ent_coef | 0.025 | Entropy bonus — sustains exploration in self-play |
-| gamma | 0.99 | Discount factor |
+---
+
+## Training
+
+Agents are trained with **alternating PPO adversarial co-training**: one agent's weights are frozen while the other trains, then roles swap. This ensures each agent always faces a stationary opponent, keeping the MDP well-defined for the learning agent.
+
+| Hyperparameter | Value |
+|---|---|
+| Algorithm | PPO (MlpPolicy, 2-layer MLP, 64 units) |
+| Steps per cycle | 2048 per agent |
+| Entropy coefficient | 0.025 |
+| Discount factor γ | 0.99 |
+| Learning rate | 3×10⁻⁴ |
+| Total steps | ~8.2M (2000 cycles × 2 agents) |
+
+Snapshots are saved every 10 cycles to `snapshots/`, yielding 201 checkpoints for post-hoc evaluation.
+
+---
+
+## Results
+
+### Reward and Entropy
+
+<p align="center">
+  <img src="figures/output/tagger_reward_entropy.png" width="700"/>
+</p>
+
+<p align="center">
+  <img src="figures/output/runner_reward_entropy.png" width="700"/>
+</p>
+
+Training reward and policy entropy are tracked across all cycles for each agent. Both agents show a consistent rise in episode reward as co-training progresses. The tagger learns quickly to chase the runner, while the runner slowly learns strategies to evade and the tagger adapts. Policy entropy declines over time, reflecting increasing policy commitment, though it remains non-zero due to the entropy regularization term (`ent_coef=0.025`) that sustains exploration against a shifting opponent. The reward function is insufficient to confirm genuine co-evolution, as it only measures relative quality against the current opponent.
+
+### Co-Evolution
+
+Every historical tagger snapshot was evaluated against every historical runner snapshot (40,401 match-ups, 100 episodes each). A custom iterative Elo system assigns each snapshot a skill rating that isolates absolute capability from opponent-specific exploits.
+
+<p align="center">
+  <img src="figures/output/elo_rating.png" width="700"/>
+</p>
+
+Both agents improve monotonically through ~cycle 1000, confirming genuine transitive co-evolution. The tagger peaks at **Elo +709** (cycle 1380) and the runner at **Elo +503** (cycle 1070). Late-stage collapse, where both Elo curves dip sharply, reveals intransitive overfitting: agents micro-optimize against their current opponent and lose generalizability against the broader historical population.
+
+### Emergent Spatial Behavior
+
+<p align="center">
+  <img src="figures/output/position_heatmaps_log.png" width="700"/>
+</p>
+
+Occupancy heatmaps track spatial strategy across three checkpoints. Early agents cluster randomly. At peak, the tagger sweeps the grid broadly to maximize line-of-sight, while the runner hugs walls and corners. The mature runner spent **83% of steps adjacent to a wall** vs. 46% early on. Late-stage overfit agents exhibit high variance and stray from generalized spatial reasoning, collapsing to narrow, brittle routes.
+
+### Learned Action Profile
+
+<p align="center">
+  <img src="figures/output/action_distribution.png" width="700"/>
+</p>
+
+The tagger's STAY usage drops to ~0% by cycle 200. By cycle 1380, **over 65% of actions are diagonal**. The policy network learned the geometric advantage of diagonal traversal without being explicitly taught it.
+
+### Predictive Interception
+
+<p align="center">
+  <img src="figures/output/anticipation_heatmap.png" width="600"/>
+</p>
+
+A 3-step Monte Carlo rollout of the tagger's action distribution at cycles 100 vs. 1380, with the runner occluded by a wall. The early tagger diffuses probability mass against the wall (reactive pursuit). The mature tagger routes sharply around the obstacle toward an intercept point *without ever seeing the runner*, demonstrating an implicit prediction of the runner's trajectory without explicit trajectory modeling.
+
+---
+
+## Get Started
+
+- [Installation](docs/installation.md)
+- [Training, evaluation, and plotting](docs/usage.md)
