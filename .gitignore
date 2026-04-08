@@ -8,8 +8,12 @@ snapshots3/
 snapshots4/
 snapshots5/
 tensorboard_logs/
+
+# Evaluation
 results/
 figures/output/
+figures/plot_elo_rating.py
+figures/plot_anticipation_heatmap.py
 
 # Python
 __pycache__/
